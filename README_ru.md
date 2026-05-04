@@ -1,10 +1,12 @@
 # Amnezia WARP Host Routing
 
+[English](https://github.com/isultanov99/amnezia-warp-host-routing/blob/master/README.md) | [Russian](https://github.com/isultanov99/amnezia-warp-host-routing/blob/master/README_ru.md)
+
+## О скрипте
+
 Небольшой Bash-установщик для маршрутизации исходящего трафика контейнеров Amnezia через Cloudflare WARP на уровне хоста, при этом входящие подключения продолжают приходить на реальный IP VPS.
 
 Установщик делает timestamp-бэкапы перед изменениями и умеет откатываться к выбранному snapshot прямо из меню.
-
-## Что делает скрипт
 
 Скрипт решает такую задачу:
 

@@ -1,10 +1,12 @@
 # Amnezia WARP Host Routing
 
+[English](https://github.com/isultanov99/amnezia-warp-host-routing/blob/master/README.md) | [Russian](https://github.com/isultanov99/amnezia-warp-host-routing/blob/master/README_ru.md)
+
+## About
+
 Host-level Cloudflare WARP egress routing for Amnezia Docker containers.
 
 The installer creates timestamped pre-change backups and can roll back to a chosen snapshot from the menu.
-
-## What It Does
 
 This script solves a specific server-side problem:
 
