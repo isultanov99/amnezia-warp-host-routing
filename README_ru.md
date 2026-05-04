@@ -2,6 +2,8 @@
 
 Небольшой Bash-установщик для маршрутизации исходящего трафика контейнеров Amnezia через Cloudflare WARP на уровне хоста, при этом входящие подключения продолжают приходить на реальный IP VPS.
 
+Установщик делает timestamp-бэкапы перед изменениями и умеет откатываться к выбранному snapshot прямо из меню.
+
 ## Что делает скрипт
 
 Скрипт решает такую задачу:
@@ -34,6 +36,8 @@
     - `amnezia-awg2` (v2)
     - `amnezia-xray` (xray)
   - умеет ставить WARP при его отсутствии
+  - делает timestamp-бэкапы перед каждым изменяющим шагом
+  - умеет откатываться к выбранному backup snapshot из меню
   - умеет удалять всё, что настроил сам
   - показывает статус сети, IP контейнеров и состояние routing service прямо в меню
 
@@ -118,8 +122,9 @@ Containers
 3) Install or refresh routing for AWG v2 only
 4) Install or refresh routing for Amnezia Xray only
 5) Remove everything configured by this script
-6) Show status
-7) Exit
+6) Rollback to a backup snapshot
+7) Show status
+8) Exit
 ```
 
 Неинтерактивная установка всего найденного:
@@ -171,12 +176,31 @@ sudo WARP_IF=wg0 WAN_IF=ens34 ./deploy_amnezia_warp_host.sh
 - `/etc/systemd/system/amnezia-warp-routing@.service`
 - `/etc/amnezia-warp/*.env`
 - `/etc/sysctl.d/99-amnezia-warp.conf`
+- timestamped snapshot’ы в `/var/backups/amnezia-warp-host-routing` по умолчанию
 
 Если WARP ставится самим скриптом, дополнительно создаются:
 
 - `/etc/wireguard/wgcf.conf`
 - `/etc/wireguard/wgcf-account.toml`
 - `/usr/local/bin/wgcf`
+
+## Откат
+
+Перед каждым изменяющим шагом скрипт сохраняет timestamp-snapshot с управляемыми файлами и состоянием сервисов.
+
+Откат из интерактивного меню:
+
+- `Rollback to a backup snapshot`
+
+По умолчанию snapshot’ы лежат в:
+
+- `/var/backups/amnezia-warp-host-routing`
+
+Путь можно переопределить:
+
+```bash
+BACKUP_ROOT=/custom/path
+```
 
 ## Как проверять
 

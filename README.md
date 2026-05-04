@@ -2,6 +2,8 @@
 
 Host-level Cloudflare WARP egress routing for Amnezia Docker containers.
 
+The installer creates timestamped pre-change backups and can roll back to a chosen snapshot from the menu.
+
 ## What It Does
 
 This script solves a specific server-side problem:
@@ -34,6 +36,8 @@ The script does not replace the VPS default route and does not attempt to hide i
   - `amnezia-awg2` (v2)
   - `amnezia-xray` (xray)
   - can install WARP if missing
+  - creates timestamped backup snapshots before each mutating step
+  - can roll back to a selected backup snapshot from the menu
   - can uninstall and return the host to the pre-routing state
   - shows network status, container IPs, routing state, and debug info in the menu
 
@@ -116,8 +120,9 @@ Containers
 3) Install or refresh routing for AWG v2 only
 4) Install or refresh routing for Amnezia Xray only
 5) Remove everything configured by this script
-6) Show status
-7) Exit
+6) Rollback to a backup snapshot
+7) Show status
+8) Exit
 ```
 
 Non-interactive install for everything found:
@@ -171,12 +176,31 @@ The installer writes:
 - `/etc/systemd/system/amnezia-warp-routing@.service`
 - `/etc/amnezia-warp/*.env`
 - `/etc/sysctl.d/99-amnezia-warp.conf`
+- timestamped snapshots under `/var/backups/amnezia-warp-host-routing` by default
 
 If WARP is bootstrapped by the script, it also writes:
 
 - `/etc/wireguard/wgcf.conf`
 - `/etc/wireguard/wgcf-account.toml`
 - `/usr/local/bin/wgcf`
+
+## Rollback
+
+Before each mutating step, the script creates a timestamped snapshot of its managed files and service state.
+
+You can restore one from the interactive menu with:
+
+- `Rollback to a backup snapshot`
+
+By default, snapshots are stored in:
+
+- `/var/backups/amnezia-warp-host-routing`
+
+You can override the location with:
+
+```bash
+BACKUP_ROOT=/custom/path
+```
 
 ## Verification
 

@@ -19,6 +19,7 @@ WAN_IF="${WAN_IF:-}"
 WAN_SUBNET="${WAN_SUBNET:-}"
 WAN_IP="${WAN_IP:-}"
 WARP_PROFILE_NAME="${WARP_PROFILE_NAME:-wgcf}"
+BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/amnezia-warp-host-routing}"
 AUTO_YES="${AUTO_YES:-0}"
 ACTION="${1:-}"
 
@@ -32,6 +33,7 @@ AMN_SUBNET=""
 AMN_IP=""
 MENU_SELECTION=""
 MENU_ACTION=""
+ROLLBACK_SNAPSHOT=""
 COLOR=1
 
 if [[ ! -t 1 ]] || [[ "${TERM:-}" == "dumb" ]]; then
@@ -197,6 +199,172 @@ for line in out.splitlines():
         raise SystemExit(0)
 raise SystemExit(1)
 PY
+}
+
+backup_snapshot_paths() {
+  cat <<EOF
+/etc/amnezia-warp
+/usr/local/sbin/amnezia-warp-routing.sh
+/etc/systemd/system/amnezia-warp-routing@.service
+/etc/sysctl.d/99-amnezia-warp.conf
+/etc/wireguard/${WARP_PROFILE_NAME}.conf
+/etc/wireguard/wgcf-account.toml
+/usr/local/bin/wgcf
+EOF
+}
+
+service_enabled_bool() {
+  if systemctl is-enabled "$1" >/dev/null 2>&1; then
+    printf '1\n'
+  else
+    printf '0\n'
+  fi
+}
+
+service_active_bool() {
+  if systemctl is-active --quiet "$1" 2>/dev/null; then
+    printf '1\n'
+  else
+    printf '0\n'
+  fi
+}
+
+snapshot_copy_path() {
+  local snapshot_dir="$1"
+  local path="$2"
+  local target="${snapshot_dir}/files${path}"
+  if [[ -e "${path}" ]]; then
+    mkdir -p "$(dirname "${target}")"
+    cp -a "${path}" "${target}"
+  fi
+}
+
+create_backup_snapshot() {
+  local step="$1"
+  local ts snapshot_dir suffix
+  ts="$(date +%Y%m%d-%H%M%S)"
+  suffix="${step//[^a-zA-Z0-9._-]/-}"
+  snapshot_dir="${BACKUP_ROOT}/${ts}-${suffix}"
+
+  mkdir -p "${snapshot_dir}/files"
+  while read -r path; do
+    [[ -n "${path}" ]] || continue
+    snapshot_copy_path "${snapshot_dir}" "${path}"
+  done < <(backup_snapshot_paths)
+
+  cat > "${snapshot_dir}/state.env" <<EOF
+SNAPSHOT_STEP='${step}'
+SNAPSHOT_TIMESTAMP='${ts}'
+BASE_TABLE='${BASE_TABLE}'
+WARP_PROFILE_NAME='${WARP_PROFILE_NAME}'
+WG_QUICK_ENABLED='$(service_enabled_bool "wg-quick@${WARP_PROFILE_NAME}.service")'
+WG_QUICK_ACTIVE='$(service_active_bool "wg-quick@${WARP_PROFILE_NAME}.service")'
+ROUTING_LEGACY_ENABLED='$(service_enabled_bool "amnezia-warp-routing@legacy.service")'
+ROUTING_LEGACY_ACTIVE='$(service_active_bool "amnezia-warp-routing@legacy.service")'
+ROUTING_V2_ENABLED='$(service_enabled_bool "amnezia-warp-routing@v2.service")'
+ROUTING_V2_ACTIVE='$(service_active_bool "amnezia-warp-routing@v2.service")'
+ROUTING_XRAY_ENABLED='$(service_enabled_bool "amnezia-warp-routing@xray.service")'
+ROUTING_XRAY_ACTIVE='$(service_active_bool "amnezia-warp-routing@xray.service")'
+EOF
+
+  ip rule show > "${snapshot_dir}/ip-rule.txt" 2>/dev/null || true
+  ip route show table "${BASE_TABLE}" > "${snapshot_dir}/route-table.txt" 2>/dev/null || true
+  iptables-save -t mangle > "${snapshot_dir}/iptables-mangle.txt" 2>/dev/null || true
+
+  ok "Created backup snapshot: $(basename "${snapshot_dir}")"
+}
+
+list_backup_snapshots() {
+  [[ -d "${BACKUP_ROOT}" ]] || return 0
+  find "${BACKUP_ROOT}" -mindepth 1 -maxdepth 1 -type d | sort -r
+}
+
+managed_path_remove_or_restore() {
+  local snapshot_dir="$1"
+  local path="$2"
+  local source="${snapshot_dir}/files${path}"
+  rm -rf "${path}"
+  if [[ -e "${source}" ]]; then
+    mkdir -p "$(dirname "${path}")"
+    cp -a "${source}" "${path}"
+  fi
+}
+
+restore_service_state() {
+  local service_name="$1"
+  local enabled="$2"
+  local active="$3"
+
+  if [[ "${enabled}" == "1" ]]; then
+    systemctl enable "${service_name}" >/dev/null 2>&1 || true
+  else
+    systemctl disable "${service_name}" >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${active}" == "1" ]]; then
+    systemctl restart "${service_name}"
+  else
+    systemctl stop "${service_name}" >/dev/null 2>&1 || true
+  fi
+}
+
+restore_backup_snapshot() {
+  local snapshot_dir="$1"
+  local path
+  [[ -d "${snapshot_dir}" ]] || die "backup snapshot not found: ${snapshot_dir}"
+  [[ -f "${snapshot_dir}/state.env" ]] || die "backup snapshot is missing state.env: ${snapshot_dir}"
+
+  # shellcheck disable=SC1090
+  . "${snapshot_dir}/state.env"
+
+  disable_container_service legacy
+  disable_container_service v2
+  disable_container_service xray
+  systemctl stop "wg-quick@${WARP_PROFILE_NAME}.service" >/dev/null 2>&1 || true
+  systemctl disable "wg-quick@${WARP_PROFILE_NAME}.service" >/dev/null 2>&1 || true
+
+  while read -r path; do
+    [[ -n "${path}" ]] || continue
+    managed_path_remove_or_restore "${snapshot_dir}" "${path}"
+  done < <(backup_snapshot_paths)
+
+  systemctl daemon-reload
+  sysctl --system >/dev/null 2>&1 || true
+
+  restore_service_state "wg-quick@${WARP_PROFILE_NAME}.service" "${WG_QUICK_ENABLED}" "${WG_QUICK_ACTIVE}"
+  restore_service_state "amnezia-warp-routing@legacy.service" "${ROUTING_LEGACY_ENABLED}" "${ROUTING_LEGACY_ACTIVE}"
+  restore_service_state "amnezia-warp-routing@v2.service" "${ROUTING_V2_ENABLED}" "${ROUTING_V2_ACTIVE}"
+  restore_service_state "amnezia-warp-routing@xray.service" "${ROUTING_XRAY_ENABLED}" "${ROUTING_XRAY_ACTIVE}"
+
+  log
+  ok "Rollback completed from snapshot: $(basename "${snapshot_dir}")"
+}
+
+choose_backup_snapshot() {
+  local options=()
+  local snapshots=()
+  local idx
+
+  while read -r snapshot; do
+    [[ -n "${snapshot}" ]] || continue
+    snapshots+=("${snapshot}")
+    options+=("$(basename "${snapshot}")")
+  done < <(list_backup_snapshots)
+
+  if [[ "${#snapshots[@]}" -eq 0 ]]; then
+    warn "No backup snapshots found in ${BACKUP_ROOT}"
+    ROLLBACK_SNAPSHOT=""
+    return 1
+  fi
+
+  prompt_menu_choice "Choose a backup snapshot to restore: " "${options[@]}"
+  for ((idx=0; idx<${#options[@]}; idx++)); do
+    if [[ "${options[$idx]}" == "${MENU_SELECTION}" ]]; then
+      ROLLBACK_SNAPSHOT="${snapshots[$idx]}"
+      return 0
+    fi
+  done
+  die "backup selection resolution failed"
 }
 
 detect_containers() {
@@ -779,6 +947,7 @@ uninstall_selection() {
     all)
       disable_container_service legacy
       disable_container_service v2
+      disable_container_service xray
       cleanup_shared_files
       uninstall_host_warp
       ;;
@@ -827,7 +996,7 @@ run_uninstall() {
 }
 
 show_status() {
-  local suffix
+  local suffix backup_count latest_backup
   menu_header
   if systemctl is-active --quiet "wg-quick@${WARP_PROFILE_NAME}.service" 2>/dev/null; then
     if [[ -n "${WARP_IF}" ]] && have_iface "${WARP_IF}"; then
@@ -864,8 +1033,14 @@ show_status() {
     log "  Env files:"
     find /etc/amnezia-warp -maxdepth 1 -type f -name '*.env' -printf '    %f\n' 2>/dev/null || true
   fi
+  backup_count="$(list_backup_snapshots | wc -l | tr -d ' ')"
+  latest_backup="$(list_backup_snapshots | head -n1 | xargs -r basename)"
+  log "  Backup snapshots: ${backup_count:-0}"
+  if [[ -n "${latest_backup}" ]]; then
+    log "  Latest backup: ${latest_backup}"
+  fi
   log "  Policy rules:"
-  ip rule show 2>/dev/null | grep -E '10061|10062|10066' | sed 's/^/    /' || log "    none"
+  ip rule show 2>/dev/null | grep -E '10061|10062|10063|10066' | sed 's/^/    /' || log "    none"
   log "  Routing table ${BASE_TABLE}:"
   ip route show table "${BASE_TABLE}" 2>/dev/null | sed 's/^/    /' || log "    empty"
 }
@@ -905,23 +1080,21 @@ choose_main_action() {
     [[ -n "${suffix}" ]] && configured+=("${suffix}")
   done < <(configured_service_names)
 
-  if [[ "${#CONTAINERS_FOUND[@]}" -eq 0 ]]; then
-    die "no amnezia-awg, amnezia-awg2, or amnezia-xray containers were found"
-  fi
-
-  labels+=("install:all")
-  options+=("Install WARP and route all detected containers")
-  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg'; then
-    labels+=("install:legacy")
-    options+=("Install or refresh routing for AWG Legacy only")
-  fi
-  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
-    labels+=("install:v2")
-    options+=("Install or refresh routing for AWG v2 only")
-  fi
-  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-xray'; then
-    labels+=("install:xray")
-    options+=("Install or refresh routing for Amnezia Xray only")
+  if [[ "${#CONTAINERS_FOUND[@]}" -gt 0 ]]; then
+    labels+=("install:all")
+    options+=("Install WARP and route all detected containers")
+    if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg'; then
+      labels+=("install:legacy")
+      options+=("Install or refresh routing for AWG Legacy only")
+    fi
+    if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
+      labels+=("install:v2")
+      options+=("Install or refresh routing for AWG v2 only")
+    fi
+    if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-xray'; then
+      labels+=("install:xray")
+      options+=("Install or refresh routing for Amnezia Xray only")
+    fi
   fi
   if [[ "${#configured[@]}" -gt 0 ]]; then
     labels+=("remove:all")
@@ -941,6 +1114,10 @@ choose_main_action() {
   elif [[ -n "${WARP_IF}" ]]; then
     labels+=("remove:warp-only")
     options+=("Remove host-level WARP only")
+  fi
+  if list_backup_snapshots | grep -q .; then
+    labels+=("rollback")
+    options+=("Rollback to a backup snapshot")
   fi
   labels+=("status")
   options+=("Show status")
@@ -962,10 +1139,12 @@ run_selection() {
   local selection="$1"
   detect_wan
   detect_docker_bridges
+  create_backup_snapshot "pre-install-helper-template"
   install_helper_template
 
   if [[ -z "${WARP_IF}" ]]; then
     warn "Host-level WARP was not found. Bootstrapping it with wgcf."
+    create_backup_snapshot "pre-install-host-warp"
     install_host_warp
     detect_warp_if || true
   fi
@@ -973,22 +1152,28 @@ run_selection() {
   case "${selection}" in
     all)
       if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg'; then
+        create_backup_snapshot "pre-configure-amnezia-awg"
         configure_container "amnezia-awg" "$(container_ip_by_name amnezia-awg)"
       fi
       if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
+        create_backup_snapshot "pre-configure-amnezia-awg2"
         configure_container "amnezia-awg2" "$(container_ip_by_name amnezia-awg2)"
       fi
       if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-xray'; then
+        create_backup_snapshot "pre-configure-amnezia-xray"
         configure_container "amnezia-xray" "$(container_ip_by_name amnezia-xray)"
       fi
       ;;
     legacy)
+      create_backup_snapshot "pre-configure-amnezia-awg"
       configure_container "amnezia-awg" "$(container_ip_by_name amnezia-awg)"
       ;;
     v2)
+      create_backup_snapshot "pre-configure-amnezia-awg2"
       configure_container "amnezia-awg2" "$(container_ip_by_name amnezia-awg2)"
       ;;
     xray)
+      create_backup_snapshot "pre-configure-amnezia-xray"
       configure_container "amnezia-xray" "$(container_ip_by_name amnezia-xray)"
       ;;
     exit)
@@ -1032,10 +1217,25 @@ main() {
   if [[ "${ACTION}" == "uninstall" ]]; then
     menu_header
     if [[ "${AUTO_YES}" == "1" ]]; then
+      create_backup_snapshot "pre-uninstall-all"
       run_uninstall "all"
     else
       choose_main_action
-      run_uninstall "${MENU_ACTION#remove:}"
+      case "${MENU_ACTION}" in
+        remove:*)
+          create_backup_snapshot "pre-uninstall-${MENU_ACTION#remove:}"
+          run_uninstall "${MENU_ACTION#remove:}"
+          ;;
+        status)
+          show_status
+          ;;
+        exit)
+          log "No changes made."
+          ;;
+        *)
+          die "please choose a removal action when using uninstall mode"
+          ;;
+      esac
     fi
     return
   fi
@@ -1054,11 +1254,17 @@ main() {
       install:legacy) run_selection "legacy"; return ;;
       install:v2) run_selection "v2"; return ;;
       install:xray) run_selection "xray"; return ;;
-      remove:all) run_uninstall "all"; return ;;
-      remove:legacy) run_uninstall "legacy"; return ;;
-      remove:v2) run_uninstall "v2"; return ;;
-      remove:xray) run_uninstall "xray"; return ;;
-      remove:warp-only) run_uninstall "warp-only"; return ;;
+      remove:all) create_backup_snapshot "pre-uninstall-all"; run_uninstall "all"; return ;;
+      remove:legacy) create_backup_snapshot "pre-uninstall-legacy"; run_uninstall "legacy"; return ;;
+      remove:v2) create_backup_snapshot "pre-uninstall-v2"; run_uninstall "v2"; return ;;
+      remove:xray) create_backup_snapshot "pre-uninstall-xray"; run_uninstall "xray"; return ;;
+      remove:warp-only) create_backup_snapshot "pre-uninstall-warp-only"; run_uninstall "warp-only"; return ;;
+      rollback)
+        if choose_backup_snapshot; then
+          restore_backup_snapshot "${ROLLBACK_SNAPSHOT}"
+        fi
+        return
+        ;;
       status) show_status ;;
       exit) log "No changes made."; return ;;
       *) die "unknown selection" ;;
