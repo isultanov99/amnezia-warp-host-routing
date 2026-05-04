@@ -7,6 +7,7 @@ set -euo pipefail
 # It supports:
 # - amnezia-awg   (legacy)
 # - amnezia-awg2  (v2)
+# - amnezia-xray  (xray)
 #
 # If no host WARP interface exists, it can install one via wgcf with Table=off,
 # so the host default route remains untouched.
@@ -202,7 +203,7 @@ detect_containers() {
   local name
   CONTAINERS_FOUND=()
   CONTAINER_SRC_IP=()
-  for name in amnezia-awg amnezia-awg2; do
+  for name in amnezia-awg amnezia-awg2 amnezia-xray; do
     if docker inspect "$name" >/dev/null 2>&1; then
       CONTAINERS_FOUND+=("$name")
       CONTAINER_SRC_IP+=("$(find_best_container_ip "$name")")
@@ -471,6 +472,7 @@ mark_for_container() {
   case "$1" in
     amnezia-awg) printf '0x61\n' ;;
     amnezia-awg2) printf '0x62\n' ;;
+    amnezia-xray) printf '0x63\n' ;;
     *) printf '0x66\n' ;;
   esac
 }
@@ -479,6 +481,7 @@ prio_for_container() {
   case "$1" in
     amnezia-awg) printf '10061\n' ;;
     amnezia-awg2) printf '10062\n' ;;
+    amnezia-xray) printf '10063\n' ;;
     *) printf '10066\n' ;;
   esac
 }
@@ -487,6 +490,7 @@ chain_for_container() {
   case "$1" in
     amnezia-awg) printf 'AMN_WARP_AWG\n' ;;
     amnezia-awg2) printf 'AMN_WARP_AWG2\n' ;;
+    amnezia-xray) printf 'AMN_WARP_XRAY\n' ;;
     *) printf 'AMN_WARP_GENERIC\n' ;;
   esac
 }
@@ -495,6 +499,7 @@ service_suffix() {
   case "$1" in
     amnezia-awg) printf 'legacy\n' ;;
     amnezia-awg2) printf 'v2\n' ;;
+    amnezia-xray) printf 'xray\n' ;;
     *) printf '%s\n' "$1" ;;
   esac
 }
@@ -654,9 +659,10 @@ container_ip_by_name() {
 }
 
 menu_header() {
-  local warp_status legacy_status v2_status
+  local warp_status legacy_status v2_status xray_status
   legacy_status="not found"
   v2_status="not found"
+  xray_status="not found"
   WARP_IF="${WARP_IF:-}"
   detect_warp_if || true
   detect_wan || true
@@ -666,6 +672,9 @@ menu_header() {
   fi
   if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
     v2_status="found"
+  fi
+  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-xray'; then
+    xray_status="found"
   fi
   if [[ -n "${WARP_IF}" ]]; then
     warp_status="found (${WARP_IF})"
@@ -693,6 +702,11 @@ menu_header() {
     log "    container IP: $(container_ip_by_name amnezia-awg2)"
     log "    routing service: $(state_text "$(routing_service_state v2)")"
   fi
+  log "  Amnezia Xray: $(state_text "${xray_status}")"
+  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-xray'; then
+    log "    container IP: $(container_ip_by_name amnezia-xray)"
+    log "    routing service: $(state_text "$(routing_service_state xray)")"
+  fi
   log "  Host WARP: $(state_text "${warp_status}")"
   printf '\n'
 }
@@ -710,6 +724,9 @@ configured_service_names() {
   fi
   if [[ -f /etc/amnezia-warp/v2.env ]] || service_exists "amnezia-warp-routing@v2.service"; then
     names+=("v2")
+  fi
+  if [[ -f /etc/amnezia-warp/xray.env ]] || service_exists "amnezia-warp-routing@xray.service"; then
+    names+=("xray")
   fi
   printf '%s\n' "${names[@]}"
 }
@@ -775,6 +792,11 @@ uninstall_selection() {
       cleanup_shared_files
       uninstall_host_warp
       ;;
+    xray)
+      disable_container_service xray
+      cleanup_shared_files
+      uninstall_host_warp
+      ;;
     *)
       die "unknown uninstall selection: ${selection}"
       ;;
@@ -787,7 +809,7 @@ uninstall_selection() {
 run_uninstall() {
   local selection="$1"
   case "${selection}" in
-    all|legacy|v2)
+    all|legacy|v2|xray)
       uninstall_selection "${selection}"
       ;;
     warp-only)
@@ -817,7 +839,7 @@ show_status() {
   else
     log "Host WARP service: $(state_text "$(host_warp_unit_state)")"
   fi
-  for suffix in legacy v2; do
+  for suffix in legacy v2 xray; do
     if systemctl is-active --quiet "amnezia-warp-routing@${suffix}.service" 2>/dev/null; then
       log "Routing service ${suffix}: $(state_text "active")"
     elif systemctl is-failed --quiet "amnezia-warp-routing@${suffix}.service" 2>/dev/null; then
@@ -884,7 +906,7 @@ choose_main_action() {
   done < <(configured_service_names)
 
   if [[ "${#CONTAINERS_FOUND[@]}" -eq 0 ]]; then
-    die "no amnezia-awg or amnezia-awg2 containers were found"
+    die "no amnezia-awg, amnezia-awg2, or amnezia-xray containers were found"
   fi
 
   labels+=("install:all")
@@ -897,6 +919,10 @@ choose_main_action() {
     labels+=("install:v2")
     options+=("Install or refresh routing for AWG v2 only")
   fi
+  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-xray'; then
+    labels+=("install:xray")
+    options+=("Install or refresh routing for Amnezia Xray only")
+  fi
   if [[ "${#configured[@]}" -gt 0 ]]; then
     labels+=("remove:all")
     options+=("Remove everything configured by this script")
@@ -907,6 +933,10 @@ choose_main_action() {
     if printf '%s\n' "${configured[@]}" | grep -qx 'v2'; then
       labels+=("remove:v2")
       options+=("Remove AWG v2 routing")
+    fi
+    if printf '%s\n' "${configured[@]}" | grep -qx 'xray'; then
+      labels+=("remove:xray")
+      options+=("Remove Amnezia Xray routing")
     fi
   elif [[ -n "${WARP_IF}" ]]; then
     labels+=("remove:warp-only")
@@ -948,12 +978,18 @@ run_selection() {
       if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
         configure_container "amnezia-awg2" "$(container_ip_by_name amnezia-awg2)"
       fi
+      if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-xray'; then
+        configure_container "amnezia-xray" "$(container_ip_by_name amnezia-xray)"
+      fi
       ;;
     legacy)
       configure_container "amnezia-awg" "$(container_ip_by_name amnezia-awg)"
       ;;
     v2)
       configure_container "amnezia-awg2" "$(container_ip_by_name amnezia-awg2)"
+      ;;
+    xray)
+      configure_container "amnezia-xray" "$(container_ip_by_name amnezia-xray)"
       ;;
     exit)
       log "No changes made."
@@ -1017,9 +1053,11 @@ main() {
       install:all) run_selection "all"; return ;;
       install:legacy) run_selection "legacy"; return ;;
       install:v2) run_selection "v2"; return ;;
+      install:xray) run_selection "xray"; return ;;
       remove:all) run_uninstall "all"; return ;;
       remove:legacy) run_uninstall "legacy"; return ;;
       remove:v2) run_uninstall "v2"; return ;;
+      remove:xray) run_uninstall "xray"; return ;;
       remove:warp-only) run_uninstall "warp-only"; return ;;
       status) show_status ;;
       exit) log "No changes made."; return ;;

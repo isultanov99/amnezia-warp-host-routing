@@ -1,12 +1,12 @@
 # Amnezia WARP Host Routing
 
-Host-level Cloudflare WARP egress routing for AmneziaWG Docker containers.
+Host-level Cloudflare WARP egress routing for Amnezia Docker containers.
 
 ## What It Does
 
 This script solves a specific server-side problem:
 
-- `amnezia-awg` or `amnezia-awg2` keeps accepting inbound VPN traffic on the VPS public IP
+- `amnezia-awg`, `amnezia-awg2`, or `amnezia-xray` keeps accepting inbound VPN traffic on the VPS public IP
 - selected outgoing traffic from the container is policy-routed through a host WARP interface
 - external services see a Cloudflare IP instead of the VPS IP
 - the host default route stays unchanged
@@ -32,6 +32,7 @@ The script does not replace the VPS default route and does not attempt to hide i
   - interactive installer for:
   - `amnezia-awg` (legacy)
   - `amnezia-awg2` (v2)
+  - `amnezia-xray` (xray)
   - can install WARP if missing
   - can uninstall and return the host to the pre-routing state
   - shows network status, container IPs, routing state, and debug info in the menu
@@ -45,6 +46,7 @@ Target host requirements:
 - one of these containers present:
 - `amnezia-awg`
 - `amnezia-awg2`
+- `amnezia-xray`
 - root access
 - `iptables` available
 - `python3` available
@@ -59,19 +61,19 @@ For automatic WARP bootstrap through `wgcf`:
 Run directly from GitHub with `curl`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/isultanov99/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/isultanov99/amnezia-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
 ```
 
 Or with `wget`:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/isultanov99/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/isultanov99/amnezia-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
 ```
 
 If you prefer to inspect the script before running it:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/isultanov99/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh
+curl -fsSLO https://raw.githubusercontent.com/isultanov99/amnezia-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh
 chmod +x deploy_amnezia_warp_host.sh
 sudo ./deploy_amnezia_warp_host.sh
 ```
@@ -104,14 +106,18 @@ Containers
   AmneziaWG v2: found
     container IP: 172.29.172.5
     routing service: active
+  Amnezia Xray: found
+    container IP: 172.29.172.3
+    routing service: not installed
   Host WARP: not found
 
 1) Install WARP and route all detected containers
 2) Install or refresh routing for AWG Legacy only
 3) Install or refresh routing for AWG v2 only
-4) Remove everything configured by this script
-5) Show status
-6) Exit
+4) Install or refresh routing for Amnezia Xray only
+5) Remove everything configured by this script
+6) Show status
+7) Exit
 ```
 
 Non-interactive install for everything found:

@@ -1,12 +1,12 @@
 # Amnezia WARP Host Routing
 
-Небольшой Bash-установщик для маршрутизации исходящего трафика контейнеров AmneziaWG через Cloudflare WARP на уровне хоста, при этом входящие подключения продолжают приходить на реальный IP VPS.
+Небольшой Bash-установщик для маршрутизации исходящего трафика контейнеров Amnezia через Cloudflare WARP на уровне хоста, при этом входящие подключения продолжают приходить на реальный IP VPS.
 
 ## Что делает скрипт
 
 Скрипт решает такую задачу:
 
-- `amnezia-awg` или `amnezia-awg2` продолжают принимать входящие подключения на публичном IP сервера
+- `amnezia-awg`, `amnezia-awg2` или `amnezia-xray` продолжают принимать входящие подключения на публичном IP сервера
 - исходящий интернет-трафик выбранных контейнеров policy-routing'ом уходит через host-level WARP
 - внешние сервисы видят Cloudflare IP вместо IP VPS
 - default route самого хоста не меняется
@@ -32,6 +32,7 @@
   - интерактивный установщик для:
     - `amnezia-awg` (legacy)
     - `amnezia-awg2` (v2)
+    - `amnezia-xray` (xray)
   - умеет ставить WARP при его отсутствии
   - умеет удалять всё, что настроил сам
   - показывает статус сети, IP контейнеров и состояние routing service прямо в меню
@@ -45,6 +46,7 @@
 - хотя бы один контейнер:
   - `amnezia-awg`
   - `amnezia-awg2`
+  - `amnezia-xray`
 - root-доступ
 - `iptables`
 - `python3`
@@ -61,19 +63,19 @@
 Запуск напрямую с GitHub через `curl`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/isultanov99/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/isultanov99/amnezia-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
 ```
 
 Или через `wget`:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/isultanov99/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/isultanov99/amnezia-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
 ```
 
 Если хочется сначала посмотреть скрипт:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/isultanov99/amnezia-wg-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh
+curl -fsSLO https://raw.githubusercontent.com/isultanov99/amnezia-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh
 chmod +x deploy_amnezia_warp_host.sh
 sudo ./deploy_amnezia_warp_host.sh
 ```
@@ -106,14 +108,18 @@ Containers
   AmneziaWG v2: found
     container IP: 172.29.172.5
     routing service: active
+  Amnezia Xray: found
+    container IP: 172.29.172.3
+    routing service: not installed
   Host WARP: not found
 
 1) Install WARP and route all detected containers
 2) Install or refresh routing for AWG Legacy only
 3) Install or refresh routing for AWG v2 only
-4) Remove everything configured by this script
-5) Show status
-6) Exit
+4) Install or refresh routing for Amnezia Xray only
+5) Remove everything configured by this script
+6) Show status
+7) Exit
 ```
 
 Неинтерактивная установка всего найденного:
