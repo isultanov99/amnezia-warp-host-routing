@@ -70,6 +70,8 @@ Run directly from GitHub with `curl`:
 curl -fsSL https://raw.githubusercontent.com/isultanov99/amnezia-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
 ```
 
+Interactive prompts are read from `/dev/tty`, so the menu still works with `curl | bash` when a TTY is available.
+
 Or with `wget`:
 
 ```bash

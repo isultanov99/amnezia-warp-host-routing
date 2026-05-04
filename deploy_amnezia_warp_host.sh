@@ -1057,7 +1057,11 @@ prompt_menu_choice() {
 
   while true; do
     printf '%s' "${prompt}"
-    IFS= read -r choice
+    if [[ -r /dev/tty ]]; then
+      IFS= read -r choice </dev/tty
+    else
+      IFS= read -r choice
+    fi
     [[ "${choice}" =~ ^[0-9]+$ ]] || {
       warn "Please enter a number from the menu."
       continue

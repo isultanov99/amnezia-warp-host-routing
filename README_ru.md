@@ -72,6 +72,8 @@
 curl -fsSL https://raw.githubusercontent.com/isultanov99/amnezia-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
 ```
 
+Интерактивные вопросы читаются из `/dev/tty`, поэтому меню продолжает работать и при `curl | bash`, если доступен TTY.
+
 Или через `wget`:
 
 ```bash
