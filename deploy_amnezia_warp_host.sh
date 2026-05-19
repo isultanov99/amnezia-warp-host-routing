@@ -207,6 +207,14 @@ get_container_ipv4s() {
     | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true
 }
 
+get_container_ipv4s_csv() {
+  local name="$1"
+  local ips
+  ips="$(get_container_ipv4s "${name}" | paste -sd',' -)"
+  [[ -n "${ips}" ]] || die "could not determine IPv4s for container ${name}"
+  printf '%s\n' "${ips}"
+}
+
 find_best_container_ip() {
   local name="$1"
   local ip
@@ -771,8 +779,8 @@ set -a
 set +a
 
 up() {
-  local route triplet subnet iface ip
-  local -a route_entries excludes
+  local route triplet subnet iface ip src
+  local -a route_entries excludes srcs
 
   modprobe br_netfilter || true
   sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null
@@ -804,10 +812,14 @@ up() {
   iptables -t mangle -A PREROUTING -m mark --mark "${MARK}" -j CONNMARK --save-mark
 
   IFS=' ' read -r -a excludes <<<"${EXCLUDES}"
-  for dst in "${excludes[@]}"; do
-    iptables -t mangle -A "${CHAIN}" -s "${SRC}" -d "${dst}" -j RETURN
+  IFS=',' read -r -a srcs <<<"${SRCS:-${SRC}}"
+  for src in "${srcs[@]}"; do
+    [[ -n "${src}" ]] || continue
+    for dst in "${excludes[@]}"; do
+      iptables -t mangle -A "${CHAIN}" -s "${src}" -d "${dst}" -j RETURN
+    done
+    iptables -t mangle -A "${CHAIN}" -s "${src}" -m conntrack --ctstate NEW -j MARK --set-mark "${MARK}"
   done
-  iptables -t mangle -A "${CHAIN}" -s "${SRC}" -m conntrack --ctstate NEW -j MARK --set-mark "${MARK}"
 }
 
 down() {
@@ -866,7 +878,7 @@ build_routes_string() {
 configure_container() {
   local name="$1"
   local src_ip="$2"
-  local suffix mark prio chain env_file service_name routes excludes
+  local suffix mark prio chain env_file service_name routes excludes srcs_csv
 
   ensure_amn_for_ip "${src_ip}"
   suffix="$(service_suffix "${name}")"
@@ -874,6 +886,7 @@ configure_container() {
   prio="$(prio_for_container "${name}")"
   chain="$(chain_for_container "${name}")"
   routes="$(build_routes_string)"
+  srcs_csv="$(get_container_ipv4s_csv "${name}")"
   excludes="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 ${WAN_SUBNET} 100.64.0.0/10"
 
   mkdir -p /etc/amnezia-warp
@@ -886,6 +899,7 @@ MARK=${mark}
 PRIO=${prio}
 CHAIN=${chain}
 SRC=${src_ip}/32
+SRCS=${srcs_csv}
 WARP_IF=${WARP_IF}
 ROUTES='${routes}'
 EXCLUDES='${excludes}'
@@ -1009,7 +1023,7 @@ container_egress_summary() {
 }
 
 show_container_block() {
-  local title="$1" container_name="$2" suffix="$3" found_state service_state egress_summary current_ip configured_src
+  local title="$1" container_name="$2" suffix="$3" found_state service_state egress_summary current_ip configured_src configured_srcs current_ips_csv
   found_state="not found"
   if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx "${container_name}"; then
     found_state="found"
@@ -1019,10 +1033,16 @@ show_container_block() {
   if [[ "${found_state}" == "found" ]]; then
     service_state="$(routing_service_state "${suffix}")"
     current_ip="$(container_ip_by_name "${container_name}")"
+    current_ips_csv="$(get_container_ipv4s_csv "${container_name}")"
     log "    container IP: ${current_ip}"
     log "    routing service: $(state_text "${service_state}")"
     configured_src="$(service_src_from_env "${suffix}" || true)"
-    if [[ -n "${configured_src}" && -n "${current_ip}" && "${configured_src}" != "${current_ip}" ]]; then
+    configured_srcs="$(service_srcs_from_env "${suffix}" || true)"
+    if [[ -n "${configured_srcs}" ]]; then
+      if [[ ",${configured_srcs}," != *",${current_ip},"* ]]; then
+        warn "    configured SRCS mismatch: env uses ${configured_srcs}, container now has ${current_ips_csv}"
+      fi
+    elif [[ -n "${configured_src}" && -n "${current_ip}" && "${configured_src}" != "${current_ip}" ]]; then
       warn "    configured SRC mismatch: env uses ${configured_src}, container is ${current_ip}"
     fi
     if [[ "${service_state}" == "active" ]]; then
@@ -1088,6 +1108,13 @@ service_src_from_env() {
   local env_file="/etc/amnezia-warp/${suffix}.env"
   [[ -f "${env_file}" ]] || return 1
   awk -F= '$1=="SRC" {print $2}' "${env_file}" 2>/dev/null | sed 's#/32$##' | head -n1
+}
+
+service_srcs_from_env() {
+  local suffix="$1"
+  local env_file="/etc/amnezia-warp/${suffix}.env"
+  [[ -f "${env_file}" ]] || return 1
+  awk -F= '$1=="SRCS" {print $2}' "${env_file}" 2>/dev/null | head -n1
 }
 
 configured_service_names() {
