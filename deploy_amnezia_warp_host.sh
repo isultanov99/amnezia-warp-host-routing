@@ -115,6 +115,44 @@ host_warp_unit_state() {
   printf 'inactive\n'
 }
 
+warp_trace_summary_for_iface() {
+  local iface="$1"
+  local trace_line ip_line loc_line warp_value ip_value loc_value
+  if [[ -z "${iface}" ]] || ! have_iface "${iface}"; then
+    printf 'interface-missing\n'
+    return
+  fi
+
+  trace_line="$(curl -4fsSL --max-time 10 --interface "${iface}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+  if [[ -z "${trace_line}" ]]; then
+    printf 'unreachable\n'
+    return
+  fi
+
+  warp_value="$(printf '%s\n' "${trace_line}" | awk -F= '$1=="warp" {print $2; exit}')"
+  ip_value="$(printf '%s\n' "${trace_line}" | awk -F= '$1=="ip" {print $2; exit}')"
+  loc_value="$(printf '%s\n' "${trace_line}" | awk -F= '$1=="loc" {print $2; exit}')"
+  [[ -n "${warp_value}" ]] || warp_value="unknown"
+  [[ -n "${ip_value}" ]] || ip_value="unknown"
+  [[ -n "${loc_value}" ]] || loc_value="unknown"
+  printf 'warp=%s ip=%s loc=%s\n' "${warp_value}" "${ip_value}" "${loc_value}"
+}
+
+warp_trace_summary() {
+  local iface="${WARP_IF:-}"
+  local summary
+  summary="$(warp_trace_summary_for_iface "${iface}")"
+  if [[ "${summary}" == warp=* ]]; then
+    printf '%s\n' "${summary}" | awk -F'[ =]' '/^warp=/{print $2}'
+  else
+    printf '%s\n' "${summary}"
+  fi
+}
+
+verify_warp_connection() {
+  [[ "$(warp_trace_summary)" == "on" ]]
+}
+
 die() {
   printf '%sError:%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2
   exit 1
@@ -398,7 +436,12 @@ routing_service_state() {
 }
 
 detect_warp_if() {
-  local ifname
+  local ifname summary
+  local candidates=()
+  local options=()
+  local labels=()
+  local warp_on_count=0
+  local warp_on_iface=""
   if [[ -n "${WARP_IF}" ]]; then
     have_iface "${WARP_IF}" || die "WARP interface not found: ${WARP_IF}"
     return
@@ -406,11 +449,50 @@ detect_warp_if() {
 
   while read -r ifname; do
     [[ -n "${ifname}" ]] || continue
-    if [[ "${ifname}" == wg* ]]; then
-      WARP_IF="${ifname}"
-      return
+    if [[ "${ifname}" == "warp" || "${ifname}" == wg* ]]; then
+      candidates+=("${ifname}")
     fi
   done < <(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1)
+
+  if [[ "${#candidates[@]}" -eq 0 ]]; then
+    return
+  fi
+
+  if [[ "${#candidates[@]}" -eq 1 ]]; then
+    WARP_IF="${candidates[0]}"
+    return
+  fi
+
+  for ifname in "${candidates[@]}"; do
+    summary="$(warp_trace_summary_for_iface "${ifname}")"
+    labels+=("${ifname}")
+    options+=("${ifname} (${summary})")
+    if [[ "${summary}" == warp=on* ]]; then
+      warp_on_count=$((warp_on_count + 1))
+      warp_on_iface="${ifname}"
+    fi
+  done
+
+  if [[ "${warp_on_count}" -eq 1 ]]; then
+    WARP_IF="${warp_on_iface}"
+    return
+  fi
+
+  if [[ "${AUTO_YES}" == "1" || ! -r /dev/tty ]]; then
+    WARP_IF="${candidates[0]}"
+    warn "Multiple WARP-like interfaces found. Auto-selected ${WARP_IF}. Set WARP_IF=... to override."
+    return
+  fi
+
+  warn "Multiple WARP-like interfaces found. Select the interface to use for host WARP routing:"
+  prompt_menu_choice "Choose WARP interface: " "${options[@]}"
+  local idx
+  for ((idx=0; idx<${#options[@]}; idx++)); do
+    if [[ "${options[$idx]}" == "${MENU_SELECTION}" ]]; then
+      WARP_IF="${labels[$idx]}"
+      return
+    fi
+  done
 }
 
 detect_wan() {
@@ -826,6 +908,134 @@ container_ip_by_name() {
   return 1
 }
 
+json_field_from_text() {
+  local json_text="$1" key="$2"
+  JSON_INPUT="${json_text}" python3 - "$key" <<'PY'
+import json, os, sys
+key = sys.argv[1]
+raw = os.environ.get("JSON_INPUT", "")
+if not raw:
+    raise SystemExit(1)
+try:
+    data = json.loads(raw)
+except Exception:
+    raise SystemExit(1)
+value = data.get(key, "")
+if value is None:
+    value = ""
+print(value)
+PY
+}
+
+resolve_ipv4() {
+  local host="$1"
+  getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1 {print $1}'
+}
+
+container_http_probe_raw() {
+  local name="$1" kind="$2"
+  docker exec "$name" sh -lc "
+if command -v curl >/dev/null 2>&1; then
+  if [ '${kind}' = 'ipinfo' ]; then
+    curl -fsSL --max-time 8 https://ipinfo.io
+  else
+    curl -fsSL --max-time 8 http://ip-api.com/json/
+  fi
+elif command -v wget >/dev/null 2>&1; then
+  if [ '${kind}' = 'ipinfo' ]; then
+    wget -qO- --timeout=8 https://ipinfo.io
+  else
+    wget -qO- --timeout=8 http://ip-api.com/json/
+  fi
+else
+  exit 127
+fi
+" 2>/dev/null || true
+}
+
+container_http_probe() {
+  local name="$1" kind="$2" pid ipinfo_ip ipapi_ip
+  pid="$(docker inspect -f '{{.State.Pid}}' "$name" 2>/dev/null || true)"
+  ipinfo_ip="$(resolve_ipv4 ipinfo.io)"
+  ipapi_ip="$(resolve_ipv4 ip-api.com)"
+
+  if [[ "${kind}" == "ipinfo" ]]; then
+    if [[ -n "${pid}" && "${pid}" != "0" && -n "${ipinfo_ip}" ]]; then
+      if command -v nsenter >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+        nsenter -t "${pid}" -n curl -4fsSL --max-time 8 --resolve "ipinfo.io:443:${ipinfo_ip}" https://ipinfo.io 2>/dev/null || true
+        return
+      fi
+    fi
+    container_http_probe_raw "${name}" "ipinfo"
+    return
+  fi
+
+  if [[ "${kind}" == "ipapi" ]]; then
+    if [[ -n "${pid}" && "${pid}" != "0" && -n "${ipapi_ip}" ]]; then
+      if command -v nsenter >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+        nsenter -t "${pid}" -n curl -4fsSL --max-time 8 -H "Host: ip-api.com" "http://${ipapi_ip}/json/" 2>/dev/null || true
+        return
+      fi
+    fi
+    container_http_probe_raw "${name}" "ipapi"
+    return
+  fi
+}
+
+container_egress_summary() {
+  local name="$1" ipinfo_json ipapi_json egress_ip country city isp
+  ipinfo_json="$(container_http_probe "${name}" 'ipinfo')"
+  ipapi_json="$(container_http_probe "${name}" 'ipapi')"
+
+  egress_ip="$(json_field_from_text "${ipinfo_json}" ip 2>/dev/null || true)"
+  if [[ -z "${egress_ip}" ]]; then
+    egress_ip="$(json_field_from_text "${ipapi_json}" query 2>/dev/null || true)"
+  fi
+
+  country="$(json_field_from_text "${ipapi_json}" country 2>/dev/null || true)"
+  city="$(json_field_from_text "${ipapi_json}" city 2>/dev/null || true)"
+  isp="$(json_field_from_text "${ipapi_json}" isp 2>/dev/null || true)"
+
+  if [[ -z "${egress_ip}${country}${city}${isp}" ]]; then
+    printf 'unavailable\n'
+    return
+  fi
+
+  [[ -n "${egress_ip}" ]] || egress_ip="unknown"
+  [[ -n "${country}" ]] || country="unknown"
+  [[ -n "${city}" ]] || city="unknown"
+  [[ -n "${isp}" ]] || isp="unknown"
+  printf '%s | %s | %s | %s\n' "${egress_ip}" "${country}" "${city}" "${isp}"
+}
+
+show_container_block() {
+  local title="$1" container_name="$2" suffix="$3" found_state service_state egress_summary current_ip configured_src
+  found_state="not found"
+  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx "${container_name}"; then
+    found_state="found"
+  fi
+
+  log "  ${title}: $(state_text "${found_state}")"
+  if [[ "${found_state}" == "found" ]]; then
+    service_state="$(routing_service_state "${suffix}")"
+    current_ip="$(container_ip_by_name "${container_name}")"
+    log "    container IP: ${current_ip}"
+    log "    routing service: $(state_text "${service_state}")"
+    configured_src="$(service_src_from_env "${suffix}" || true)"
+    if [[ -n "${configured_src}" && -n "${current_ip}" && "${configured_src}" != "${current_ip}" ]]; then
+      warn "    configured SRC mismatch: env uses ${configured_src}, container is ${current_ip}"
+    fi
+    if [[ "${service_state}" == "active" ]]; then
+      egress_summary="$(container_egress_summary "${container_name}")"
+      if [[ "${egress_summary}" == "unavailable" ]]; then
+        log "    egress probe: unavailable (checked with curl/wget to ipinfo.io and ip-api.com)"
+      else
+        log "    egress IP: ${egress_summary}"
+      fi
+    fi
+  fi
+}
+
 menu_header() {
   local warp_status legacy_status v2_status xray_status
   legacy_status="not found"
@@ -860,21 +1070,9 @@ menu_header() {
   log "  Amnezia bridge: ${AMN_IF:-auto}"
   log
   printf '%sContainers%s\n' "${C_BOLD}" "${C_RESET}"
-  log "  AmneziaWG Legacy: $(state_text "${legacy_status}")"
-  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg'; then
-    log "    container IP: $(container_ip_by_name amnezia-awg)"
-    log "    routing service: $(state_text "$(routing_service_state legacy)")"
-  fi
-  log "  AmneziaWG v2: $(state_text "${v2_status}")"
-  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
-    log "    container IP: $(container_ip_by_name amnezia-awg2)"
-    log "    routing service: $(state_text "$(routing_service_state v2)")"
-  fi
-  log "  Amnezia Xray: $(state_text "${xray_status}")"
-  if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-xray'; then
-    log "    container IP: $(container_ip_by_name amnezia-xray)"
-    log "    routing service: $(state_text "$(routing_service_state xray)")"
-  fi
+  show_container_block "AmneziaWG Legacy" "amnezia-awg" "legacy"
+  show_container_block "AmneziaWG v2" "amnezia-awg2" "v2"
+  show_container_block "Amnezia Xray" "amnezia-xray" "xray"
   log "  Host WARP: $(state_text "${warp_status}")"
   printf '\n'
 }
@@ -883,6 +1081,13 @@ service_exists() {
   local suffix="${1#amnezia-warp-routing@}"
   suffix="${suffix%.service}"
   [[ -f "/etc/amnezia-warp/${suffix}.env" ]] || systemctl is-enabled "$1" >/dev/null 2>&1
+}
+
+service_src_from_env() {
+  local suffix="$1"
+  local env_file="/etc/amnezia-warp/${suffix}.env"
+  [[ -f "${env_file}" ]] || return 1
+  awk -F= '$1=="SRC" {print $2}' "${env_file}" 2>/dev/null | sed 's#/32$##' | head -n1
 }
 
 configured_service_names() {
@@ -996,7 +1201,7 @@ run_uninstall() {
 }
 
 show_status() {
-  local suffix backup_count latest_backup
+  local suffix backup_count latest_backup warp_verify
   menu_header
   if systemctl is-active --quiet "wg-quick@${WARP_PROFILE_NAME}.service" 2>/dev/null; then
     if [[ -n "${WARP_IF}" ]] && have_iface "${WARP_IF}"; then
@@ -1029,6 +1234,8 @@ show_status() {
     log "  WARP link: not present"
   fi
   log "  WARP unit state: $(state_text "$(host_warp_unit_state)")"
+  warp_verify="$(warp_trace_summary)"
+  log "  WARP trace check: ${warp_verify}"
   if [[ -d /etc/amnezia-warp ]]; then
     log "  Env files:"
     find /etc/amnezia-warp -maxdepth 1 -type f -name '*.env' -printf '    %f\n' 2>/dev/null || true
@@ -1191,10 +1398,30 @@ run_selection() {
 
   log
   ok "Routing is configured."
-  log "Verification:"
-  log "  Open any IP / ISP lookup site from a VPN-connected client."
-  log "  Examples: myip.com, 2ip.io, whatismyipaddress.com, whatismyisp.com, dnschecker.org"
-  log "  You should see a Cloudflare-owned IP instead of the VPS IP."
+  log "Post-check:"
+  log "  Host WARP trace check: $(warp_trace_summary)"
+  case "${selection}" in
+    all)
+      if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg'; then
+        show_container_block "AmneziaWG Legacy" "amnezia-awg" "legacy"
+      fi
+      if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
+        show_container_block "AmneziaWG v2" "amnezia-awg2" "v2"
+      fi
+      if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-xray'; then
+        show_container_block "Amnezia Xray" "amnezia-xray" "xray"
+      fi
+      ;;
+    legacy)
+      show_container_block "AmneziaWG Legacy" "amnezia-awg" "legacy"
+      ;;
+    v2)
+      show_container_block "AmneziaWG v2" "amnezia-awg2" "v2"
+      ;;
+    xray)
+      show_container_block "Amnezia Xray" "amnezia-xray" "xray"
+      ;;
+  esac
 }
 
 main() {

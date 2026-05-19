@@ -17,13 +17,23 @@ This script solves a specific server-side problem:
 
 This is useful when you want VPN clients to keep using the server as an entrypoint, but make their internet-bound egress leave through WARP.
 
+## TL;DR
+
+If you do not care about the implementation details:
+
+1. Run the script on the VPS where your `amnezia-awg`, `amnezia-awg2`, or `amnezia-xray` container lives.
+2. It keeps inbound VPN access on the VPS IP.
+3. It routes outgoing internet traffic from the selected container through Cloudflare WARP.
+4. After setup, the script itself shows whether WARP is up and what egress IP the container is using.
+5. If you already use another Cloudflare WARP-based setup, for example an existing `warp` or `wg0` interface from another tool or panel, the script can reuse it instead of creating a second one.
+
 ## How It Works
 
 Under the hood the script does four things:
 
 1. Detects the Amnezia container IP, host WAN interface, Amnezia bridge, and Docker bridges.
 2. Ensures a host-level WARP interface exists.
-If one already exists, for example `wg0` from `x-ui` or `3x-ui`, it reuses it.
+If one already exists, for example an existing `warp` or `wg0` interface from another Cloudflare WARP-based tool or panel, it reuses it.
 If one does not exist, it can bootstrap `wgcf` and create `/etc/wireguard/wgcf.conf` with `Table = off`.
 3. Installs a small routing helper and `systemd` services.
 4. Applies policy routing plus `iptables` mangle rules so only marked Amnezia container egress goes through WARP.
@@ -41,7 +51,8 @@ The script does not replace the VPS default route and does not attempt to hide i
   - creates timestamped backup snapshots before each mutating step
   - can roll back to a selected backup snapshot from the menu
   - can uninstall and return the host to the pre-routing state
-  - shows network status, container IPs, routing state, and debug info in the menu
+  - shows network status, container IPs, routing state, live egress IP, WARP trace check, and debug info in the menu
+  - verifies active container egress with `curl`/`wget` against `https://ipinfo.io` and `http://ip-api.com/json/`
 
 ## Requirements
 
@@ -114,6 +125,7 @@ Containers
   AmneziaWG v2: found
     container IP: 172.29.172.5
     routing service: active
+    egress IP: 104.28.N.N | Gotham City | USA | Cloudflare, Inc.
   Amnezia Xray: found
     container IP: 172.29.172.3
     routing service: not installed
@@ -208,7 +220,12 @@ BACKUP_ROOT=/custom/path
 
 ## Verification
 
-After install, connect through the VPN and open any IP / ISP lookup site:
+After install, the script already prints a post-check:
+
+- host WARP trace status
+- live egress IP / country / city / ISP for the affected container
+
+If you still want to double-check manually, connect through the VPN and open any IP / ISP lookup site:
 
 - [myip.com](https://www.myip.com/)
 - [2ip.io](https://2ip.io/)
