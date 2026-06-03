@@ -251,7 +251,10 @@ backup_snapshot_paths() {
   cat <<EOF
 /etc/amnezia-warp
 /usr/local/sbin/amnezia-warp-routing.sh
+/usr/local/sbin/amnezia-warp-reconcile.sh
 /etc/systemd/system/amnezia-warp-routing@.service
+/etc/systemd/system/amnezia-warp-reconcile.service
+/etc/systemd/system/amnezia-warp-reconcile.timer
 /etc/sysctl.d/99-amnezia-warp.conf
 /etc/wireguard/${WARP_PROFILE_NAME}.conf
 /etc/wireguard/wgcf-account.toml
@@ -311,6 +314,8 @@ ROUTING_V2_ENABLED='$(service_enabled_bool "amnezia-warp-routing@v2.service")'
 ROUTING_V2_ACTIVE='$(service_active_bool "amnezia-warp-routing@v2.service")'
 ROUTING_XRAY_ENABLED='$(service_enabled_bool "amnezia-warp-routing@xray.service")'
 ROUTING_XRAY_ACTIVE='$(service_active_bool "amnezia-warp-routing@xray.service")'
+RECONCILE_TIMER_ENABLED='$(service_enabled_bool "amnezia-warp-reconcile.timer")'
+RECONCILE_TIMER_ACTIVE='$(service_active_bool "amnezia-warp-reconcile.timer")'
 EOF
 
   ip rule show > "${snapshot_dir}/ip-rule.txt" 2>/dev/null || true
@@ -381,6 +386,7 @@ restore_backup_snapshot() {
   restore_service_state "amnezia-warp-routing@legacy.service" "${ROUTING_LEGACY_ENABLED}" "${ROUTING_LEGACY_ACTIVE}"
   restore_service_state "amnezia-warp-routing@v2.service" "${ROUTING_V2_ENABLED}" "${ROUTING_V2_ACTIVE}"
   restore_service_state "amnezia-warp-routing@xray.service" "${ROUTING_XRAY_ENABLED}" "${ROUTING_XRAY_ACTIVE}"
+  restore_service_state "amnezia-warp-reconcile.timer" "${RECONCILE_TIMER_ENABLED:-0}" "${RECONCILE_TIMER_ACTIVE:-0}"
 
   log
   ok "Rollback completed from snapshot: $(basename "${snapshot_dir}")"
@@ -839,6 +845,96 @@ esac
 EOF
   chmod 0755 /usr/local/sbin/amnezia-warp-routing.sh
 
+  cat > /usr/local/sbin/amnezia-warp-reconcile.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_DIR="${1:-/etc/amnezia-warp}"
+ROUTING_HELPER="${ROUTING_HELPER:-/usr/local/sbin/amnezia-warp-routing.sh}"
+
+log() {
+  printf '%s\n' "$*"
+}
+
+env_files() {
+  local found=0 f
+  [[ -d "${ENV_DIR}" ]] || return 0
+  for f in "${ENV_DIR}"/*.env; do
+    [[ -f "${f}" ]] || continue
+    found=1
+    printf '%s\n' "${f}"
+  done
+  [[ "${found}" == "1" ]]
+}
+
+rule_exists() {
+  ip rule show 2>/dev/null | grep -F "fwmark ${MARK} " | grep -Fq " lookup ${TABLE}"
+}
+
+default_route_exists() {
+  ip route show table "${TABLE}" 2>/dev/null | grep -Fq "default dev ${WARP_IF}"
+}
+
+chain_exists() {
+  iptables -t mangle -S "${CHAIN}" >/dev/null 2>&1
+}
+
+prerouting_jump_exists() {
+  iptables -t mangle -S PREROUTING 2>/dev/null | grep -Fq -- "-j ${CHAIN}"
+}
+
+mark_rule_exists() {
+  iptables -t mangle -S "${CHAIN}" 2>/dev/null | grep -Fq -- "--set-xmark ${MARK}/"
+}
+
+needs_reconcile() {
+  [[ -n "${TABLE:-}" && -n "${MARK:-}" && -n "${CHAIN:-}" && -n "${WARP_IF:-}" ]] || return 0
+  ip link show "${WARP_IF}" >/dev/null 2>&1 || return 0
+  rule_exists || return 0
+  default_route_exists || return 0
+  chain_exists || return 0
+  prerouting_jump_exists || return 0
+  mark_rule_exists || return 0
+  return 1
+}
+
+reconcile_env() {
+  local env_file="$1"
+
+  TABLE=
+  MARK=
+  PRIO=
+  CHAIN=
+  SRC=
+  SRCS=
+  WARP_IF=
+  ROUTES=
+  EXCLUDES=
+
+  set -a
+  # shellcheck disable=SC1090
+  . "${env_file}"
+  set +a
+
+  if needs_reconcile; then
+    log "Re-applying Amnezia WARP routing for $(basename "${env_file}")"
+    "${ROUTING_HELPER}" up "${env_file}"
+  fi
+}
+
+main() {
+  local env_file
+  [[ -x "${ROUTING_HELPER}" ]] || exit 0
+  while IFS= read -r env_file; do
+    [[ -n "${env_file}" ]] || continue
+    reconcile_env "${env_file}"
+  done < <(env_files || true)
+}
+
+main "$@"
+EOF
+  chmod 0755 /usr/local/sbin/amnezia-warp-reconcile.sh
+
   cat > /etc/systemd/system/amnezia-warp-routing@.service <<'EOF'
 [Unit]
 Description=Route Amnezia container %i egress through host WARP
@@ -856,6 +952,31 @@ ExecStop=/usr/local/sbin/amnezia-warp-routing.sh down /etc/amnezia-warp/%i.env
 WantedBy=multi-user.target
 EOF
   sed -i "s/WGCF_PROFILE/${WARP_PROFILE_NAME}/g" /etc/systemd/system/amnezia-warp-routing@.service
+
+  cat > /etc/systemd/system/amnezia-warp-reconcile.service <<'EOF'
+[Unit]
+Description=Reconcile Amnezia WARP host routing runtime state
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/amnezia-warp-reconcile.sh /etc/amnezia-warp
+EOF
+
+  cat > /etc/systemd/system/amnezia-warp-reconcile.timer <<'EOF'
+[Unit]
+Description=Periodically reconcile Amnezia WARP host routing
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Unit=amnezia-warp-reconcile.service
+
+[Install]
+WantedBy=timers.target
+EOF
 
   cat > /etc/sysctl.d/99-amnezia-warp.conf <<'EOF'
 net.bridge.bridge-nf-call-iptables=1
@@ -909,6 +1030,12 @@ EOF
   systemctl enable "${service_name}" >/dev/null 2>&1 || true
   systemctl restart "${service_name}"
   log "Configured ${name} via ${service_name}"
+}
+
+enable_reconcile_timer() {
+  systemctl daemon-reload
+  systemctl enable --now amnezia-warp-reconcile.timer >/dev/null 2>&1 || true
+  systemctl start amnezia-warp-reconcile.service >/dev/null 2>&1 || true
 }
 
 container_ip_by_name() {
@@ -1146,9 +1273,14 @@ cleanup_shared_files() {
   local remaining
   remaining="$(find /etc/amnezia-warp -maxdepth 1 -type f -name '*.env' 2>/dev/null | wc -l | tr -d ' ')"
   if [[ "${remaining}" == "0" ]]; then
+    systemctl disable --now amnezia-warp-reconcile.timer >/dev/null 2>&1 || true
+    systemctl stop amnezia-warp-reconcile.service >/dev/null 2>&1 || true
     rm -rf /etc/amnezia-warp
     rm -f /usr/local/sbin/amnezia-warp-routing.sh
+    rm -f /usr/local/sbin/amnezia-warp-reconcile.sh
     rm -f /etc/systemd/system/amnezia-warp-routing@.service
+    rm -f /etc/systemd/system/amnezia-warp-reconcile.service
+    rm -f /etc/systemd/system/amnezia-warp-reconcile.timer
     rm -f /etc/sysctl.d/99-amnezia-warp.conf
     systemctl daemon-reload
   fi
@@ -1214,6 +1346,7 @@ run_uninstall() {
       uninstall_selection "${selection}"
       ;;
     warp-only)
+      cleanup_shared_files
       uninstall_host_warp
       log
       ok "Removal completed."
@@ -1249,6 +1382,11 @@ show_status() {
       log "Routing service ${suffix}: $(state_text "installed") but inactive"
     fi
   done
+  if systemctl is-active --quiet amnezia-warp-reconcile.timer 2>/dev/null; then
+    log "Reconcile timer: $(state_text "active")"
+  elif systemctl list-unit-files amnezia-warp-reconcile.timer --no-legend 2>/dev/null | grep -q '^amnezia-warp-reconcile\.timer'; then
+    log "Reconcile timer: $(state_text "installed") but inactive"
+  fi
   log
   printf '%sDebug%s\n' "${C_BOLD}" "${C_RESET}"
   log "  Kernel: $(uname -r)"
@@ -1422,6 +1560,8 @@ run_selection() {
       die "unknown selection: ${selection}"
       ;;
   esac
+
+  enable_reconcile_timer
 
   log
   ok "Routing is configured."

@@ -35,10 +35,12 @@
 2. Проверяет, есть ли host-level WARP.
    - Если интерфейс уже есть, например `wg0` от `x-ui` или `3x-ui`, он будет использован повторно.
    - Если WARP нет, скрипт может поднять его через `wgcf`, создав `/etc/wireguard/wgcf.conf` с `Table = off`.
-3. Устанавливает helper-скрипт и `systemd` unit’ы для маршрутизации.
+3. Устанавливает system-level helper-скрипты и `systemd` unit’ы.
 4. Добавляет policy routing и `iptables` mangle rules так, чтобы через WARP шёл только нужный исходящий трафик контейнеров.
 
 Скрипт не подменяет default route VPS и не пытается «спрятать» входящие порты за Cloudflare.
+
+Во время настройки скрипт пишет файлы в `/etc` и `/usr/local/sbin`, создаёт `systemd` unit’ы, включает timer и применяет live-правила routing/firewall.
 
 ## Основной файл
 
@@ -59,19 +61,22 @@
 На целевом хосте должны быть:
 
 - Linux с `systemd`
-- установленный и работающий Docker
-- хотя бы один контейнер:
-  - `amnezia-awg`
-  - `amnezia-awg2`
-  - `amnezia-xray`
 - root-доступ
-- `iptables`
+- установленный и работающий Docker
+- Docker CLI как `docker`
+- хотя бы один контейнер: `amnezia-awg`, `amnezia-awg2` или `amnezia-xray`
+- `ip` из `iproute2`
+- `iptables` с доступной mangle table
 - `python3`
+- `curl` или `wget` для status и egress-проверок
 
 Для автоматической установки WARP через `wgcf`:
 
-- Ubuntu/Debian, RHEL-family или другой дистрибутив с поддерживаемым пакетным менеджером
+- Ubuntu/Debian, RHEL-family или другой дистрибутив с `apt-get`, `dnf` или `yum`
 - исходящий доступ к GitHub и Cloudflare
+- поддержка WireGuard в ядре и `wireguard-tools`
+
+Если рабочий WARP-интерфейс уже есть, автоматическая установка WARP не нужна. В этом случае скрипт может переиспользовать существующий интерфейс, а нужны только зависимости для routing/firewall выше.
 
 ## Запуск
 
@@ -186,13 +191,25 @@ sudo WARP_IF=wg0 WAN_IF=ens34 ./deploy_amnezia_warp_host.sh
 
 ## Какие файлы создаются
 
-Скрипт пишет:
+Скрипт пишет системные файлы на хосте:
 
 - `/usr/local/sbin/amnezia-warp-routing.sh`
+- `/usr/local/sbin/amnezia-warp-reconcile.sh`
 - `/etc/systemd/system/amnezia-warp-routing@.service`
+- `/etc/systemd/system/amnezia-warp-reconcile.service`
+- `/etc/systemd/system/amnezia-warp-reconcile.timer`
 - `/etc/amnezia-warp/*.env`
 - `/etc/sysctl.d/99-amnezia-warp.conf`
 - timestamped snapshot’ы в `/var/backups/amnezia-warp-host-routing` по умолчанию
+
+Он также применяет runtime-состояние:
+
+- включает и запускает `amnezia-warp-routing@*.service` для выбранных контейнеров
+- включает и запускает `amnezia-warp-reconcile.timer`
+- добавляет `ip rule` записи для container fwmark
+- пишет маршруты в настроенную policy routing table
+- создаёт и подключает управляемые `iptables` mangle chains
+- выставляет bridge netfilter sysctls для Docker bridge traffic
 
 Если WARP ставится самим скриптом, дополнительно создаются:
 
@@ -234,6 +251,18 @@ BACKUP_ROOT=/custom/path
 - [dnschecker.org: What's My IP Address](https://dnschecker.org/whats-my-ip-address.php)
 
 Если всё настроено правильно, ты увидишь Cloudflare IP вместо IP VPS.
+
+## Self-healing
+
+Скрипт включает `amnezia-warp-reconcile.timer`.
+
+Раз в минуту он проверяет runtime-состояние ядра для настроенных контейнеров:
+
+- `ip rule` записи для container fwmark
+- default route через WARP в routing table
+- управляемые `iptables` mangle chains и PREROUTING hooks
+
+Если эти runtime-правила исчезли, а systemd routing services всё ещё выглядят активными, timer заново применяет существующую конфигурацию из `/etc/amnezia-warp/*.env`.
 
 ## Примечания
 

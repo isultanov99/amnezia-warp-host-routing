@@ -35,10 +35,12 @@ Under the hood the script does four things:
 2. Ensures a host-level WARP interface exists.
 If one already exists, for example an existing `warp` or `wg0` interface from another Cloudflare WARP-based tool or panel, it reuses it.
 If one does not exist, it can bootstrap `wgcf` and create `/etc/wireguard/wgcf.conf` with `Table = off`.
-3. Installs a small routing helper and `systemd` services.
+3. Installs system-level helper scripts and `systemd` units.
 4. Applies policy routing plus `iptables` mangle rules so only marked Amnezia container egress goes through WARP.
 
 The script does not replace the VPS default route and does not attempt to hide inbound listeners behind Cloudflare.
+
+During setup, the script writes files under `/etc` and `/usr/local/sbin`, creates `systemd` units, enables a timer, and applies live routing/firewall rules.
 
 ## File
 
@@ -59,19 +61,23 @@ The script does not replace the VPS default route and does not attempt to hide i
 Target host requirements:
 
 - Linux host with `systemd`
-- Docker installed and running
-- one of these containers present:
-- `amnezia-awg`
-- `amnezia-awg2`
-- `amnezia-xray`
 - root access
-- `iptables` available
-- `python3` available
+- Docker installed and running
+- Docker CLI available as `docker`
+- one of these containers present:
+- `amnezia-awg`, `amnezia-awg2`, or `amnezia-xray`
+- `ip` from `iproute2`
+- `iptables` with the mangle table available
+- `python3`
+- `curl` or `wget` for status and egress probes
 
 For automatic WARP bootstrap through `wgcf`:
 
-- Ubuntu/Debian, RHEL-family, or another distro with a supported package manager in the script
+- Ubuntu/Debian, RHEL-family, or another distro with `apt-get`, `dnf`, or `yum`
 - outbound access to GitHub and Cloudflare
+- WireGuard kernel support and `wireguard-tools`
+
+If you already have a working WARP interface, automatic bootstrap is not required. In that case the script can reuse the existing interface and only needs the routing/firewall dependencies above.
 
 ## Easy Install
 
@@ -186,13 +192,25 @@ sudo WARP_IF=wg0 WAN_IF=ens34 ./deploy_amnezia_warp_host.sh
 
 ## What Gets Installed
 
-The installer writes:
+The installer writes system files on the host:
 
 - `/usr/local/sbin/amnezia-warp-routing.sh`
+- `/usr/local/sbin/amnezia-warp-reconcile.sh`
 - `/etc/systemd/system/amnezia-warp-routing@.service`
+- `/etc/systemd/system/amnezia-warp-reconcile.service`
+- `/etc/systemd/system/amnezia-warp-reconcile.timer`
 - `/etc/amnezia-warp/*.env`
 - `/etc/sysctl.d/99-amnezia-warp.conf`
 - timestamped snapshots under `/var/backups/amnezia-warp-host-routing` by default
+
+It also applies runtime state:
+
+- enables and starts `amnezia-warp-routing@*.service` for selected containers
+- enables and starts `amnezia-warp-reconcile.timer`
+- adds `ip rule` entries for container fwmarks
+- writes routes into the configured policy routing table
+- creates and hooks managed `iptables` mangle chains
+- sets bridge netfilter sysctls for Docker bridge traffic
 
 If WARP is bootstrapped by the script, it also writes:
 
@@ -234,6 +252,18 @@ If you still want to double-check manually, connect through the VPN and open any
 - [DNSChecker: What's My IP Address](https://dnschecker.org/whats-my-ip-address.php)
 
 You should see a Cloudflare-owned IP instead of the VPS IP.
+
+## Self-Healing
+
+The installer enables `amnezia-warp-reconcile.timer`.
+
+Every minute it checks the runtime kernel state for the configured containers:
+
+- `ip rule` entries for container fwmarks
+- the WARP default route in the routing table
+- managed `iptables` mangle chains and PREROUTING hooks
+
+If any of those runtime rules disappear while the systemd routing services still look active, the timer re-applies the existing `/etc/amnezia-warp/*.env` configuration.
 
 ## Notes
 
