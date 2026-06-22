@@ -19,6 +19,7 @@ WAN_IF="${WAN_IF:-}"
 WAN_SUBNET="${WAN_SUBNET:-}"
 WAN_IP="${WAN_IP:-}"
 WARP_PROFILE_NAME="${WARP_PROFILE_NAME:-wgcf}"
+WARP_ENDPOINT="${WARP_ENDPOINT:-162.159.192.1:2408}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/amnezia-warp-host-routing}"
 AUTO_YES="${AUTO_YES:-0}"
 ACTION="${1:-}"
@@ -222,7 +223,7 @@ find_best_container_ip() {
   if [[ -z "${ip}" ]]; then
     ip="$(get_container_ipv4s "$name" | head -n1 || true)"
   fi
-  [[ -n "${ip}" ]] || die "could not determine IPv4 for container ${name}"
+  [[ -n "${ip}" ]] || return 1
   printf '%s\n' "${ip}"
 }
 
@@ -420,13 +421,18 @@ choose_backup_snapshot() {
 }
 
 detect_containers() {
-  local name
+  local name ip
   CONTAINERS_FOUND=()
   CONTAINER_SRC_IP=()
   for name in amnezia-awg amnezia-awg2 amnezia-xray; do
     if docker inspect "$name" >/dev/null 2>&1; then
+      ip="$(find_best_container_ip "$name" || true)"
+      if [[ -z "${ip}" ]]; then
+        warn "Container ${name} exists, but no IPv4 address was detected. Skipping it."
+        continue
+      fi
       CONTAINERS_FOUND+=("$name")
-      CONTAINER_SRC_IP+=("$(find_best_container_ip "$name")")
+      CONTAINER_SRC_IP+=("${ip}")
     fi
   done
 }
@@ -657,6 +663,64 @@ PY
   rm -rf "${tmpdir}"
 }
 
+normalize_warp_profile() {
+  local conf="$1"
+  [[ -f "${conf}" ]] || return 0
+
+  sed -i '/^DNS = /d' "${conf}"
+  WARP_ENDPOINT_VALUE="${WARP_ENDPOINT}" python3 - "${conf}" <<'PY'
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+endpoint = os.environ.get("WARP_ENDPOINT_VALUE", "").strip()
+lines = path.read_text().splitlines()
+out = []
+in_interface = False
+interface_has_table = False
+in_peer = False
+peer_has_endpoint = False
+
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        if in_interface and not interface_has_table:
+            out.append("Table = off")
+        if in_peer and endpoint and not peer_has_endpoint:
+            out.append(f"Endpoint = {endpoint}")
+        in_interface = stripped == "[Interface]"
+        interface_has_table = False
+        in_peer = stripped == "[Peer]"
+        peer_has_endpoint = False
+        out.append(line)
+        continue
+
+    if in_interface and stripped.startswith("Table ="):
+        if not interface_has_table:
+            out.append("Table = off")
+            interface_has_table = True
+        continue
+
+    if in_peer and stripped.startswith("Endpoint ="):
+        if endpoint:
+            out.append(f"Endpoint = {endpoint}")
+        else:
+            out.append(line)
+        peer_has_endpoint = True
+        continue
+
+    out.append(line)
+
+if in_interface and not interface_has_table:
+    out.append("Table = off")
+if in_peer and endpoint and not peer_has_endpoint:
+    out.append(f"Endpoint = {endpoint}")
+
+path.write_text("\n".join(out) + "\n")
+PY
+}
+
 ensure_warp_profile() {
   local wgdir="/etc/wireguard"
   local conf="${wgdir}/${WARP_PROFILE_NAME}.conf"
@@ -697,20 +761,16 @@ ensure_warp_profile() {
     mv "${wgdir}/wgcf-profile.conf" "${conf}"
   fi
 
-  sed -i '/^DNS = /d' "${conf}"
-  if ! grep -q '^Table = off$' "${conf}"; then
-    python3 - "${conf}" <<'PY'
-import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-marker = "[Interface]\n"
-idx = text.find(marker)
-if idx == -1:
-    raise SystemExit("missing [Interface] section")
-insert_at = idx + len(marker)
-text = text[:insert_at] + "Table = off\n" + text[insert_at:]
-path.write_text(text)
-PY
+  normalize_warp_profile "${conf}"
+}
+
+refresh_managed_warp_profile() {
+  local conf="/etc/wireguard/${WARP_PROFILE_NAME}.conf"
+  [[ "${WARP_IF:-}" == "${WARP_PROFILE_NAME}" ]] || return 0
+  [[ -f "${conf}" ]] || return 0
+  normalize_warp_profile "${conf}"
+  if systemctl is-active --quiet "wg-quick@${WARP_PROFILE_NAME}.service" 2>/dev/null; then
+    systemctl restart "wg-quick@${WARP_PROFILE_NAME}.service"
   fi
 }
 
@@ -1261,11 +1321,8 @@ configured_service_names() {
 disable_container_service() {
   local suffix="$1"
   local service_name="amnezia-warp-routing@${suffix}.service"
-  if systemctl list-unit-files "${service_name}" --no-legend 2>/dev/null | grep -q "^${service_name}"; then
-    systemctl disable --now "${service_name}" >/dev/null 2>&1 || true
-  else
-    systemctl stop "${service_name}" >/dev/null 2>&1 || true
-  fi
+  systemctl disable --now "${service_name}" >/dev/null 2>&1 || true
+  systemctl stop "${service_name}" >/dev/null 2>&1 || true
   rm -f "/etc/amnezia-warp/${suffix}.env"
 }
 
@@ -1358,6 +1415,24 @@ run_uninstall() {
       die "unknown uninstall selection: ${selection}"
       ;;
   esac
+}
+
+cleanup_stale_container_routing() {
+  local name suffix found
+  for name in amnezia-awg amnezia-awg2 amnezia-xray; do
+    found="0"
+    if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx "${name}"; then
+      found="1"
+    fi
+    [[ "${found}" == "0" ]] || continue
+
+    suffix="$(service_suffix "${name}")"
+    if [[ -f "/etc/amnezia-warp/${suffix}.env" ]] || service_exists "amnezia-warp-routing@${suffix}.service"; then
+      warn "Removing stale routing for ${name}; container is missing or has no IPv4 address."
+      disable_container_service "${suffix}"
+    fi
+  done
+  cleanup_shared_files
 }
 
 show_status() {
@@ -1524,9 +1599,11 @@ run_selection() {
     install_host_warp
     detect_warp_if || true
   fi
+  refresh_managed_warp_profile
 
   case "${selection}" in
     all)
+      cleanup_stale_container_routing
       if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg'; then
         create_backup_snapshot "pre-configure-amnezia-awg"
         configure_container "amnezia-awg" "$(container_ip_by_name amnezia-awg)"
