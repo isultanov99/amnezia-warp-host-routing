@@ -2094,19 +2094,19 @@ require_container_for_selection() {
 }
 
 main() {
-  require_root
-  require_cmd ip
-  require_cmd iptables
-  require_cmd docker
-  require_cmd python3
-  require_cmd systemctl
-
   case "${ACTION}" in
     -h|--help|help)
       usage
       return
       ;;
   esac
+
+  require_root
+  require_cmd ip
+  require_cmd iptables
+  require_cmd docker
+  require_cmd python3
+  require_cmd systemctl
 
   detect_containers
   if [[ "${ACTION}" == "install" ]]; then
@@ -2193,6 +2193,6 @@ main() {
   done
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
 fi

@@ -83,6 +83,12 @@ test_awg_version_detection() {
   unset -f docker
 }
 
+test_piped_execution() {
+  local output
+  output="$(bash -s -- help < "${ROOT_DIR}/deploy_amnezia_warp_host.sh")"
+  [[ "${output}" == *"Usage:"* ]] || fail "piped installer execution"
+}
+
 test_reconcile_refreshes_legacy_env() {
   local test_dir reconcile_script routing_script env_dir env_file
   test_dir="$(mktemp -d)"
@@ -143,5 +149,6 @@ test_non_warp_wireguard_is_ignored
 test_verified_warp_is_selected
 test_target_aliases
 test_awg_version_detection
+test_piped_execution
 test_reconcile_refreshes_legacy_env
 printf 'All tests passed.\n'
