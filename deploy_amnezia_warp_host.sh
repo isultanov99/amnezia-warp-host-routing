@@ -241,11 +241,10 @@ get_container_ipv6s_csv() {
   get_container_ipv6s "${name}" | sort -u | paste -sd',' -
 }
 
-awg_protocol_summary() {
+awg_protocol_generation() {
   local name="$1"
-  local generation tools_version
 
-  generation="$(docker exec "${name}" sh -c '
+  docker exec "${name}" sh -c '
     config=
     for candidate in /opt/amnezia/awg/awg0.conf /opt/amnezia/awg/wg0.conf; do
       if [ -f "$candidate" ]; then
@@ -261,9 +260,44 @@ awg_protocol_summary() {
     else
       printf "AWG 1.x"
     fi
-  ' 2>/dev/null || true)"
+  ' 2>/dev/null || true
+}
 
-  tools_version="$(docker exec "${name}" sh -c 'awg --version 2>/dev/null | head -n1' 2>/dev/null || true)"
+awg_tools_version() {
+  docker exec "$1" sh -c 'awg --version 2>/dev/null | head -n1' 2>/dev/null || true
+}
+
+awg_version_from_tools() {
+  local tools_version="$1"
+  if [[ "${tools_version}" =~ [Aa]mnezia[Ww][Gg]-tools[[:space:]]+v?([0-9]+\.[0-9]+) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  fi
+}
+
+awg_display_title() {
+  local name="$1" fallback="$2" tools_version version generation
+  tools_version="$(awg_tools_version "${name}")"
+  version="$(awg_version_from_tools "${tools_version}")"
+  if [[ -n "${version}" ]]; then
+    printf 'AmneziaWG v%s\n' "${version}"
+    return
+  fi
+
+  generation="$(awg_protocol_generation "${name}")"
+  if [[ "${generation}" =~ ^AWG[[:space:]]+(.+)$ ]]; then
+    printf 'AmneziaWG v%s\n' "${BASH_REMATCH[1]}"
+  else
+    printf '%s\n' "${fallback}"
+  fi
+}
+
+awg_protocol_summary() {
+  local name="$1"
+  local generation tools_version
+
+  generation="$(awg_protocol_generation "${name}")"
+  tools_version="$(awg_tools_version "${name}")"
+
   if [[ -n "${generation}" && -n "${tools_version}" ]]; then
     printf '%s; %s\n' "${generation}" "${tools_version}"
   elif [[ -n "${generation}" ]]; then
@@ -1598,7 +1632,7 @@ show_container_block() {
 }
 
 menu_header() {
-  local warp_status legacy_status v2_status xray_status
+  local warp_status legacy_status v2_status xray_status current_awg_title
   legacy_status="not found"
   v2_status="not found"
   xray_status="not found"
@@ -1634,7 +1668,8 @@ menu_header() {
   log
   printf '%sContainers%s\n' "${C_BOLD}" "${C_RESET}"
   show_container_block "AmneziaWG Legacy" "amnezia-awg" "legacy"
-  show_container_block "AmneziaWG Current (2.x/3.x)" "amnezia-awg2" "v2"
+  current_awg_title="$(awg_display_title "amnezia-awg2" "AmneziaWG Current (2.x/3.x)")"
+  show_container_block "${current_awg_title}" "amnezia-awg2" "v2"
   show_container_block "Amnezia Xray" "amnezia-xray" "xray"
   log "  Host WARP: $(state_text "${warp_status}")"
   printf '\n'
@@ -1885,7 +1920,9 @@ choose_main_action() {
   local options=()
   local labels=()
   local configured=()
-  local suffix
+  local suffix current_awg_title
+
+  current_awg_title="$(awg_display_title "amnezia-awg2" "current AWG (2.x/3.x)")"
 
   while read -r suffix; do
     [[ -n "${suffix}" ]] && configured+=("${suffix}")
@@ -1900,7 +1937,7 @@ choose_main_action() {
     fi
     if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
       labels+=("install:v2")
-      options+=("Install or refresh routing for current AWG (2.x/3.x) only")
+      options+=("Install or refresh routing for ${current_awg_title} only")
     fi
     if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-xray'; then
       labels+=("install:xray")
@@ -1916,7 +1953,7 @@ choose_main_action() {
     fi
     if printf '%s\n' "${configured[@]}" | grep -qx 'v2'; then
       labels+=("remove:v2")
-      options+=("Remove current AWG (2.x/3.x) routing")
+      options+=("Remove ${current_awg_title} routing")
     fi
     if printf '%s\n' "${configured[@]}" | grep -qx 'xray'; then
       labels+=("remove:xray")
@@ -1947,7 +1984,8 @@ choose_main_action() {
 }
 
 run_selection() {
-  local selection="$1"
+  local selection="$1" current_awg_title
+  current_awg_title="$(awg_display_title "amnezia-awg2" "AmneziaWG Current (2.x/3.x)")"
   detect_wan
   detect_docker_bridges
   create_backup_snapshot "pre-install-helper-template"
@@ -2011,7 +2049,7 @@ run_selection() {
         show_container_block "AmneziaWG Legacy" "amnezia-awg" "legacy"
       fi
       if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
-        show_container_block "AmneziaWG Current (2.x/3.x)" "amnezia-awg2" "v2"
+        show_container_block "${current_awg_title}" "amnezia-awg2" "v2"
       fi
       if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-xray'; then
         show_container_block "Amnezia Xray" "amnezia-xray" "xray"
@@ -2021,7 +2059,7 @@ run_selection() {
       show_container_block "AmneziaWG Legacy" "amnezia-awg" "legacy"
       ;;
     v2)
-      show_container_block "AmneziaWG Current (2.x/3.x)" "amnezia-awg2" "v2"
+      show_container_block "${current_awg_title}" "amnezia-awg2" "v2"
       ;;
     xray)
       show_container_block "Amnezia Xray" "amnezia-xray" "xray"

@@ -55,6 +55,34 @@ test_target_aliases() {
   assert_eq "warp-only" "$(normalize_target warp)" "warp target alias"
 }
 
+test_awg_version_detection() {
+  assert_eq "3.1" "$(awg_version_from_tools 'amneziawg-tools v3.1.20260812 - https://amnezia.org')" "AWG tools version"
+  assert_eq "2.0" "$(awg_version_from_tools 'amneziawg-tools v2.0.20240101')" "AWG 2 tools version"
+  assert_eq "" "$(awg_version_from_tools 'wireguard-tools v1.0.20210914')" "non-AWG tools version"
+
+  docker() {
+    if [[ "$*" == *"awg --version"* ]]; then
+      printf 'amneziawg-tools v3.1.20260812 - https://amnezia.org\n'
+    else
+      printf 'AWG 3.x\n'
+    fi
+  }
+  assert_eq "AmneziaWG v3.1" "$(awg_display_title amnezia-awg2 fallback)" "AWG display title from tools"
+
+  docker() {
+    if [[ "$*" != *"awg --version"* ]]; then
+      printf 'AWG 3.x\n'
+    fi
+  }
+  assert_eq "AmneziaWG v3.x" "$(awg_display_title amnezia-awg2 fallback)" "AWG display title from config"
+
+  docker() {
+    return 0
+  }
+  assert_eq "fallback" "$(awg_display_title amnezia-awg2 fallback)" "AWG display title fallback"
+  unset -f docker
+}
+
 test_reconcile_refreshes_legacy_env() {
   local test_dir reconcile_script routing_script env_dir env_file
   test_dir="$(mktemp -d)"
@@ -114,5 +142,6 @@ EOF
 test_non_warp_wireguard_is_ignored
 test_verified_warp_is_selected
 test_target_aliases
+test_awg_version_detection
 test_reconcile_refreshes_legacy_env
 printf 'All tests passed.\n'
