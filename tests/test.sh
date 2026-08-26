@@ -56,9 +56,10 @@ test_target_aliases() {
 }
 
 test_reconcile_refreshes_legacy_env() {
-  local test_dir reconcile_script env_dir env_file
+  local test_dir reconcile_script routing_script env_dir env_file
   test_dir="$(mktemp -d)"
   reconcile_script="${test_dir}/reconcile.sh"
+  routing_script="${test_dir}/routing.sh"
   env_dir="${test_dir}/env"
   env_file="${env_dir}/legacy.env"
   mkdir -p "${env_dir}"
@@ -68,11 +69,21 @@ test_reconcile_refreshes_legacy_env() {
     capture && /^EOF$/ { exit }
     capture { print }
   ' "${ROOT_DIR}/deploy_amnezia_warp_host.sh" > "${reconcile_script}"
+  awk '
+    /cat > \/usr\/local\/sbin\/amnezia-warp-routing.sh <<.EOF./ { capture=1; next }
+    capture && /^EOF$/ { exit }
+    capture { print }
+  ' "${ROOT_DIR}/deploy_amnezia_warp_host.sh" > "${routing_script}"
   bash -n "${reconcile_script}"
+  bash -n "${routing_script}"
 
   ROUTING_HELPER=/bin/true . "${reconcile_script}" "${env_dir}"
   docker() {
-    printf '172.17.0.6 172.29.172.4 '
+    if [[ "$*" == *GlobalIPv6Address* ]]; then
+      printf 'fd42:29:172::4 '
+    else
+      printf '172.17.0.6 172.29.172.4 '
+    fi
   }
   cat > "${env_file}" <<'EOF'
 TABLE=51820
@@ -95,6 +106,7 @@ EOF
   grep -qx 'CONTAINER=amnezia-awg' "${env_file}" || fail "legacy env container migration"
   grep -qx 'SRC=172.29.172.4/32' "${env_file}" || fail "legacy primary source refresh"
   grep -qx 'SRCS=172.17.0.6,172.29.172.4' "${env_file}" || fail "legacy source list refresh"
+  grep -qx 'SRCS6=fd42:29:172::4' "${env_file}" || fail "legacy IPv6 source list refresh"
   unset -f docker
   rm -rf "${test_dir}"
 }

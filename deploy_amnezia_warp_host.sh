@@ -27,12 +27,19 @@ TARGET="${2:-}"
 
 CONTAINERS_FOUND=()
 CONTAINER_SRC_IP=()
+CONTAINER_SRC_IPV6=()
 DOCKER_IFS=()
 DOCKER_SUBNETS=()
 DOCKER_IPS=()
+DOCKER_V6_IFS=()
+DOCKER_V6_SUBNETS=()
+DOCKER_V6_IPS=()
 AMN_IF=""
 AMN_SUBNET=""
 AMN_IP=""
+WAN_V6_SUBNET=""
+WAN_V6_IP=""
+WARP_V6_IP=""
 MENU_SELECTION=""
 MENU_ACTION=""
 ROLLBACK_SNAPSHOT=""
@@ -197,6 +204,10 @@ first_ipv4_ip_on_iface() {
   ip -4 -o addr show dev "$1" | awk 'NR==1 {split($4,a,"/"); print a[1]}'
 }
 
+first_global_ipv6_on_iface() {
+  ip -6 -o addr show dev "$1" scope global 2>/dev/null | awk 'NR==1 {split($4,a,"/"); print a[1]}'
+}
+
 cidr_to_network() {
   python3 - "$1" <<'PY'
 import ipaddress, sys
@@ -216,6 +227,18 @@ get_container_ipv4s_csv() {
   ips="$(get_container_ipv4s "${name}" | paste -sd',' -)"
   [[ -n "${ips}" ]] || die "could not determine IPv4s for container ${name}"
   printf '%s\n' "${ips}"
+}
+
+get_container_ipv6s() {
+  docker inspect -f '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}} {{end}}' "$1" 2>/dev/null \
+    | tr ' ' '\n' \
+    | grep -E '^[0-9A-Fa-f:]+$' \
+    | grep -v '^fe80:' || true
+}
+
+get_container_ipv6s_csv() {
+  local name="$1"
+  get_container_ipv6s "${name}" | sort -u | paste -sd',' -
 }
 
 awg_protocol_summary() {
@@ -356,6 +379,10 @@ EOF
   ip rule show > "${snapshot_dir}/ip-rule.txt" 2>/dev/null || true
   ip route show table "${BASE_TABLE}" > "${snapshot_dir}/route-table.txt" 2>/dev/null || true
   iptables-save -t mangle > "${snapshot_dir}/iptables-mangle.txt" 2>/dev/null || true
+  ip -6 rule show > "${snapshot_dir}/ip6-rule.txt" 2>/dev/null || true
+  ip -6 route show table "${BASE_TABLE}" > "${snapshot_dir}/route6-table.txt" 2>/dev/null || true
+  ip6tables-save -t mangle > "${snapshot_dir}/ip6tables-mangle.txt" 2>/dev/null || true
+  ip6tables-save -t nat > "${snapshot_dir}/ip6tables-nat.txt" 2>/dev/null || true
 
   ok "Created backup snapshot: $(basename "${snapshot_dir}")"
 }
@@ -455,9 +482,10 @@ choose_backup_snapshot() {
 }
 
 detect_containers() {
-  local name ip
+  local name ip ipv6s
   CONTAINERS_FOUND=()
   CONTAINER_SRC_IP=()
+  CONTAINER_SRC_IPV6=()
   for name in amnezia-awg amnezia-awg2 amnezia-xray; do
     if docker inspect "$name" >/dev/null 2>&1; then
       ip="$(find_best_container_ip "$name" || true)"
@@ -465,8 +493,10 @@ detect_containers() {
         warn "Container ${name} exists, but no IPv4 address was detected. Skipping it."
         continue
       fi
+      ipv6s="$(get_container_ipv6s_csv "${name}")"
       CONTAINERS_FOUND+=("$name")
       CONTAINER_SRC_IP+=("${ip}")
+      CONTAINER_SRC_IPV6+=("${ipv6s}")
     fi
   done
 }
@@ -546,8 +576,15 @@ detect_warp_if() {
   done
 }
 
+detect_warp_ipv6() {
+  WARP_V6_IP=""
+  if [[ -n "${WARP_IF:-}" ]] && have_iface "${WARP_IF}"; then
+    WARP_V6_IP="$(first_global_ipv6_on_iface "${WARP_IF}")"
+  fi
+}
+
 detect_wan() {
-  local cidr
+  local cidr cidr6
   if [[ -z "${WAN_IF}" ]]; then
     WAN_IF="$(ip route show default 0.0.0.0/0 | awk 'NR==1 {print $5}')"
   fi
@@ -564,6 +601,14 @@ detect_wan() {
     [[ -n "${cidr}" ]] || die "could not determine WAN subnet"
     WAN_SUBNET="$(cidr_to_network "${cidr}")"
   fi
+
+  if [[ -z "${WAN_V6_IP}" ]]; then
+    cidr6="$(ip -6 -o addr show dev "${WAN_IF}" scope global 2>/dev/null | awk 'NR==1 {print $4}')"
+    if [[ -n "${cidr6}" ]]; then
+      WAN_V6_IP="${cidr6%/*}"
+      WAN_V6_SUBNET="$(cidr_to_network "${cidr6}")"
+    fi
+  fi
 }
 
 detect_docker_bridges() {
@@ -571,6 +616,9 @@ detect_docker_bridges() {
   DOCKER_IFS=()
   DOCKER_SUBNETS=()
   DOCKER_IPS=()
+  DOCKER_V6_IFS=()
+  DOCKER_V6_SUBNETS=()
+  DOCKER_V6_IPS=()
 
   while read -r line; do
     ifname="$(awk '{print $2}' <<<"${line}")"
@@ -584,6 +632,18 @@ detect_docker_bridges() {
     DOCKER_SUBNETS+=("$(cidr_to_network "${cidr}")")
     DOCKER_IPS+=("${ip}")
   done < <(ip -4 -o addr show scope global)
+
+  while read -r line; do
+    ifname="$(awk '{print $2}' <<<"${line}")"
+    cidr="$(awk '{print $4}' <<<"${line}")"
+    ip="${cidr%/*}"
+    [[ "${ifname}" == "${WAN_IF}" || "${ifname}" == "${WARP_IF}" ]] && continue
+    [[ "${ifname}" == "lo" || "${ifname}" == veth* ]] && continue
+    [[ "${ifname}" == "docker0" || "${ifname}" == br-* ]] || continue
+    DOCKER_V6_IFS+=("${ifname}")
+    DOCKER_V6_SUBNETS+=("$(cidr_to_network "${cidr}")")
+    DOCKER_V6_IPS+=("${ip}")
+  done < <(ip -6 -o addr show scope global 2>/dev/null)
 }
 
 ensure_amn_for_ip() {
@@ -875,6 +935,78 @@ set -a
 . "${ENV_FILE}"
 set +a
 
+up_ipv6() {
+  local triplet subnet iface ip src dst snat_chain
+  local -a route_entries6 excludes6 srcs6
+  [[ -n "${SRCS6:-}" ]] || return 0
+  [[ -n "${WARP_IPV6:-}" ]] || {
+    echo "IPv6 sources are configured, but ${WARP_IF} has no global IPv6 address" >&2
+    return 1
+  }
+  command -v ip6tables >/dev/null 2>&1 || {
+    echo "IPv6 sources are configured, but ip6tables is unavailable" >&2
+    return 1
+  }
+  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+
+  ip -6 route flush table "${TABLE}" 2>/dev/null || true
+  IFS=';' read -r -a route_entries6 <<<"${ROUTES6:-}"
+  for triplet in "${route_entries6[@]}"; do
+    [[ -n "${triplet}" ]] || continue
+    subnet="${triplet%%|*}"
+    triplet="${triplet#*|}"
+    iface="${triplet%%|*}"
+    ip="${triplet##*|}"
+    ip -6 route replace "${subnet}" dev "${iface}" src "${ip}" table "${TABLE}"
+  done
+  ip -6 route replace default dev "${WARP_IF}" table "${TABLE}"
+  ip -6 rule del fwmark "${MARK}" lookup "${TABLE}" priority "${PRIO}" 2>/dev/null || true
+  ip -6 rule add fwmark "${MARK}" lookup "${TABLE}" priority "${PRIO}"
+
+  ip6tables -t mangle -N "${CHAIN}" 2>/dev/null || true
+  ip6tables -t mangle -F "${CHAIN}"
+  ip6tables -t mangle -D PREROUTING -m mark --mark "${MARK}" -j CONNMARK --save-mark 2>/dev/null || true
+  ip6tables -t mangle -D PREROUTING -j "${CHAIN}" 2>/dev/null || true
+  ip6tables -t mangle -D PREROUTING -j CONNMARK --restore-mark 2>/dev/null || true
+  ip6tables -t mangle -A PREROUTING -j CONNMARK --restore-mark
+  ip6tables -t mangle -A PREROUTING -j "${CHAIN}"
+  ip6tables -t mangle -A PREROUTING -m mark --mark "${MARK}" -j CONNMARK --save-mark
+
+  IFS=' ' read -r -a excludes6 <<<"${EXCLUDES6:-::1/128 fc00::/7 fe80::/10}"
+  IFS=',' read -r -a srcs6 <<<"${SRCS6}"
+  for src in "${srcs6[@]}"; do
+    [[ -n "${src}" ]] || continue
+    for dst in "${excludes6[@]}"; do
+      ip6tables -t mangle -A "${CHAIN}" -s "${src}" -d "${dst}" -j RETURN
+    done
+    ip6tables -t mangle -A "${CHAIN}" -s "${src}" -m conntrack --ctstate NEW -j MARK --set-mark "${MARK}"
+  done
+
+  snat_chain="${CHAIN}_SNAT"
+  ip6tables -t nat -N "${snat_chain}" 2>/dev/null || true
+  ip6tables -t nat -F "${snat_chain}"
+  ip6tables -t nat -D POSTROUTING -j "${snat_chain}" 2>/dev/null || true
+  ip6tables -t nat -I POSTROUTING 1 -j "${snat_chain}"
+  for src in "${srcs6[@]}"; do
+    [[ -n "${src}" ]] || continue
+    ip6tables -t nat -A "${snat_chain}" -s "${src}" -o "${WARP_IF}" -j SNAT --to-source "${WARP_IPV6}"
+  done
+}
+
+down_ipv6() {
+  local snat_chain="${CHAIN}_SNAT"
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  ip6tables -t mangle -D PREROUTING -m mark --mark "${MARK}" -j CONNMARK --save-mark 2>/dev/null || true
+  ip6tables -t mangle -D PREROUTING -j "${CHAIN}" 2>/dev/null || true
+  ip6tables -t mangle -D PREROUTING -j CONNMARK --restore-mark 2>/dev/null || true
+  ip6tables -t mangle -F "${CHAIN}" 2>/dev/null || true
+  ip6tables -t mangle -X "${CHAIN}" 2>/dev/null || true
+  ip6tables -t nat -D POSTROUTING -j "${snat_chain}" 2>/dev/null || true
+  ip6tables -t nat -F "${snat_chain}" 2>/dev/null || true
+  ip6tables -t nat -X "${snat_chain}" 2>/dev/null || true
+  ip -6 rule del fwmark "${MARK}" lookup "${TABLE}" priority "${PRIO}" 2>/dev/null || true
+}
+
 up() {
   local route triplet subnet iface ip src
   local -a route_entries excludes srcs
@@ -917,6 +1049,7 @@ up() {
     done
     iptables -t mangle -A "${CHAIN}" -s "${src}" -m conntrack --ctstate NEW -j MARK --set-mark "${MARK}"
   done
+  up_ipv6
 }
 
 down() {
@@ -926,6 +1059,7 @@ down() {
   iptables -t mangle -F "${CHAIN}" 2>/dev/null || true
   iptables -t mangle -X "${CHAIN}" 2>/dev/null || true
   ip rule del fwmark "${MARK}" lookup "${TABLE}" priority "${PRIO}" 2>/dev/null || true
+  down_ipv6
 }
 
 case "${ACTION}" in
@@ -978,6 +1112,16 @@ mark_rule_exists() {
   iptables -t mangle -S "${CHAIN}" 2>/dev/null | grep -Fq -- "--set-xmark ${MARK}/"
 }
 
+ipv6_state_exists() {
+  [[ -n "${SRCS6:-}" ]] || return 0
+  ip -6 rule show 2>/dev/null | grep -F "fwmark ${MARK} " | grep -Fq " lookup ${TABLE}" || return 1
+  ip -6 route show table "${TABLE}" 2>/dev/null | grep -Fq "default dev ${WARP_IF}" || return 1
+  ip6tables -t mangle -S "${CHAIN}" >/dev/null 2>&1 || return 1
+  ip6tables -t mangle -S PREROUTING 2>/dev/null | grep -Fq -- "-j ${CHAIN}" || return 1
+  ip6tables -t mangle -S "${CHAIN}" 2>/dev/null | grep -Fq -- "--set-xmark ${MARK}/" || return 1
+  ip6tables -t nat -S "${CHAIN}_SNAT" >/dev/null 2>&1 || return 1
+}
+
 container_for_env() {
   local env_file="$1"
   if [[ -n "${CONTAINER:-}" ]]; then
@@ -999,19 +1143,29 @@ container_ipv4s() {
     | sort -u || true
 }
 
+container_ipv6s() {
+  docker inspect -f '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}} {{end}}' "$1" 2>/dev/null \
+    | tr ' ' '\n' \
+    | grep -E '^[0-9A-Fa-f:]+$' \
+    | grep -v '^fe80:' \
+    | sort -u || true
+}
+
 update_env_sources() {
-  local env_file="$1" container="$2" primary="$3" srcs="$4" tmp
+  local env_file="$1" container="$2" primary="$3" srcs="$4" srcs6="$5" tmp
   tmp="$(mktemp "${env_file}.tmp.XXXXXX")"
-  awk -v container="${container}" -v src="${primary}/32" -v srcs="${srcs}" '
-    BEGIN { seen_container=0; seen_src=0; seen_srcs=0 }
+  awk -v container="${container}" -v src="${primary}/32" -v srcs="${srcs}" -v srcs6="${srcs6}" '
+    BEGIN { seen_container=0; seen_src=0; seen_srcs=0; seen_srcs6=0 }
     /^CONTAINER=/ { print "CONTAINER=" container; seen_container=1; next }
     /^SRC=/ { print "SRC=" src; seen_src=1; next }
     /^SRCS=/ { print "SRCS=" srcs; seen_srcs=1; next }
+    /^SRCS6=/ { print "SRCS6=" srcs6; seen_srcs6=1; next }
     { print }
     END {
       if (!seen_container) print "CONTAINER=" container
       if (!seen_src) print "SRC=" src
       if (!seen_srcs) print "SRCS=" srcs
+      if (!seen_srcs6) print "SRCS6=" srcs6
     }
   ' "${env_file}" > "${tmp}"
   chmod 0644 "${tmp}"
@@ -1019,7 +1173,7 @@ update_env_sources() {
 }
 
 refresh_container_sources() {
-  local env_file="$1" container current_list current_csv current_primary configured_csv
+  local env_file="$1" container current_list current_csv current_primary configured_csv current6_csv configured6_csv
   SOURCES_CHANGED=0
   container="$(container_for_env "${env_file}" || true)"
   [[ -n "${container}" ]] || return 0
@@ -1029,14 +1183,17 @@ refresh_container_sources() {
   current_primary="$(printf '%s\n' "${current_list}" | grep '^172\.29\.' | head -n1 || true)"
   [[ -n "${current_primary}" ]] || current_primary="$(printf '%s\n' "${current_list}" | head -n1)"
   configured_csv="$(printf '%s\n' "${SRCS:-${SRC%/32}}" | tr ',' '\n' | sed 's#/32$##' | sort -u | paste -sd',' -)"
+  current6_csv="$(container_ipv6s "${container}" | paste -sd',' -)"
+  configured6_csv="$(printf '%s\n' "${SRCS6:-}" | tr ',' '\n' | sed '/^$/d' | sort -u | paste -sd',' -)"
 
   CONTAINER="${container}"
-  if [[ "${configured_csv}" != "${current_csv}" || "${SRC:-}" != "${current_primary}/32" ]]; then
-    update_env_sources "${env_file}" "${container}" "${current_primary}" "${current_csv}" || return 1
+  if [[ "${configured_csv}" != "${current_csv}" || "${SRC:-}" != "${current_primary}/32" || "${configured6_csv}" != "${current6_csv}" ]]; then
+    update_env_sources "${env_file}" "${container}" "${current_primary}" "${current_csv}" "${current6_csv}" || return 1
     SRC="${current_primary}/32"
     SRCS="${current_csv}"
+    SRCS6="${current6_csv}"
     SOURCES_CHANGED=1
-    log "Updated $(basename "${env_file}") for ${container}: ${current_csv}"
+    log "Updated $(basename "${env_file}") for ${container}: IPv4=${current_csv} IPv6=${current6_csv:-none}"
   fi
 }
 
@@ -1049,6 +1206,7 @@ needs_reconcile() {
   chain_exists || return 0
   prerouting_jump_exists || return 0
   mark_rule_exists || return 0
+  ipv6_state_exists || return 0
   return 1
 }
 
@@ -1061,10 +1219,14 @@ reconcile_env() {
   CHAIN=
   SRC=
   SRCS=
+  SRCS6=
   CONTAINER=
   WARP_IF=
+  WARP_IPV6=
   ROUTES=
+  ROUTES6=
   EXCLUDES=
+  EXCLUDES6=
   SOURCES_CHANGED=0
 
   set -a
@@ -1171,10 +1333,29 @@ build_routes_string() {
   printf '%s\n' "${routes[*]}"
 }
 
+build_routes6_string() {
+  local routes=()
+  local i cidr6 amn_v6_ip amn_v6_subnet
+  if [[ -n "${WAN_V6_SUBNET}" && -n "${WAN_V6_IP}" ]]; then
+    routes+=("${WAN_V6_SUBNET}|${WAN_IF}|${WAN_V6_IP}")
+  fi
+  for ((i=0; i<${#DOCKER_V6_IFS[@]}; i++)); do
+    routes+=("${DOCKER_V6_SUBNETS[$i]}|${DOCKER_V6_IFS[$i]}|${DOCKER_V6_IPS[$i]}")
+  done
+  cidr6="$(ip -6 -o addr show dev "${AMN_IF}" scope global 2>/dev/null | awk 'NR==1 {print $4}')"
+  if [[ -n "${cidr6}" ]]; then
+    amn_v6_ip="${cidr6%/*}"
+    amn_v6_subnet="$(cidr_to_network "${cidr6}")"
+    routes+=("${amn_v6_subnet}|${AMN_IF}|${amn_v6_ip}")
+  fi
+  local IFS=';'
+  printf '%s\n' "${routes[*]}"
+}
+
 configure_container() {
   local name="$1"
   local src_ip="$2"
-  local suffix mark prio chain env_file service_name routes excludes srcs_csv
+  local suffix mark prio chain env_file service_name routes routes6 excludes excludes6 srcs_csv srcs6_csv
 
   ensure_amn_for_ip "${src_ip}"
   suffix="$(service_suffix "${name}")"
@@ -1182,8 +1363,12 @@ configure_container() {
   prio="$(prio_for_container "${name}")"
   chain="$(chain_for_container "${name}")"
   routes="$(build_routes_string)"
+  routes6="$(build_routes6_string)"
   srcs_csv="$(get_container_ipv4s_csv "${name}")"
+  srcs6_csv="$(get_container_ipv6s_csv "${name}")"
   excludes="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 ${WAN_SUBNET} 100.64.0.0/10"
+  excludes6="::1/128 fc00::/7 fe80::/10"
+  [[ -z "${WAN_V6_SUBNET}" ]] || excludes6+=" ${WAN_V6_SUBNET}"
 
   mkdir -p /etc/amnezia-warp
   env_file="/etc/amnezia-warp/${suffix}.env"
@@ -1197,9 +1382,13 @@ PRIO=${prio}
 CHAIN=${chain}
 SRC=${src_ip}/32
 SRCS=${srcs_csv}
+SRCS6=${srcs6_csv}
 WARP_IF=${WARP_IF}
+WARP_IPV6=${WARP_V6_IP}
 ROUTES='${routes}'
+ROUTES6='${routes6}'
 EXCLUDES='${excludes}'
+EXCLUDES6='${excludes6}'
 EOF
 
   systemctl daemon-reload
@@ -1219,6 +1408,17 @@ container_ip_by_name() {
   for ((i=0; i<${#CONTAINERS_FOUND[@]}; i++)); do
     if [[ "${CONTAINERS_FOUND[$i]}" == "$1" ]]; then
       printf '%s\n' "${CONTAINER_SRC_IP[$i]}"
+      return
+    fi
+  done
+  return 1
+}
+
+container_ipv6s_by_name() {
+  local i
+  for ((i=0; i<${#CONTAINERS_FOUND[@]}; i++)); do
+    if [[ "${CONTAINERS_FOUND[$i]}" == "$1" ]]; then
+      printf '%s\n' "${CONTAINER_SRC_IPV6[$i]}"
       return
     fi
   done
@@ -1247,6 +1447,11 @@ PY
 resolve_ipv4() {
   local host="$1"
   getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1 {print $1}'
+}
+
+resolve_ipv6() {
+  local host="$1"
+  getent ahostsv6 "$host" 2>/dev/null | awk 'NR==1 {print $1}'
 }
 
 container_http_probe_raw() {
@@ -1325,8 +1530,27 @@ container_egress_summary() {
   printf '%s | %s | %s | %s\n' "${egress_ip}" "${country}" "${city}" "${isp}"
 }
 
+container_ipv6_egress_summary() {
+  local name="$1" pid target trace warp_value ip_value loc_value
+  pid="$(docker inspect -f '{{.State.Pid}}' "${name}" 2>/dev/null || true)"
+  target="$(resolve_ipv6 www.cloudflare.com)"
+  if [[ -n "${pid}" && "${pid}" != "0" && -n "${target}" ]] \
+    && command -v nsenter >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+    trace="$(nsenter -t "${pid}" -n curl -6fsSL --max-time 8 \
+      --resolve "www.cloudflare.com:443:${target}" \
+      https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+  else
+    trace="$(docker exec "${name}" sh -lc 'curl -6fsSL --max-time 8 https://www.cloudflare.com/cdn-cgi/trace' 2>/dev/null || true)"
+  fi
+  [[ -n "${trace}" ]] || { printf 'unavailable\n'; return; }
+  warp_value="$(printf '%s\n' "${trace}" | awk -F= '$1=="warp" {print $2; exit}')"
+  ip_value="$(printf '%s\n' "${trace}" | awk -F= '$1=="ip" {print $2; exit}')"
+  loc_value="$(printf '%s\n' "${trace}" | awk -F= '$1=="loc" {print $2; exit}')"
+  printf 'warp=%s | %s | %s\n' "${warp_value:-unknown}" "${ip_value:-unknown}" "${loc_value:-unknown}"
+}
+
 show_container_block() {
-  local title="$1" container_name="$2" suffix="$3" found_state service_state egress_summary current_ip configured_src configured_srcs current_ips_csv protocol_summary
+  local title="$1" container_name="$2" suffix="$3" found_state service_state egress_summary ipv6_egress_summary current_ip current_ipv6s configured_src configured_srcs current_ips_csv protocol_summary
   found_state="not found"
   if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx "${container_name}"; then
     found_state="found"
@@ -1337,7 +1561,13 @@ show_container_block() {
     service_state="$(routing_service_state "${suffix}")"
     current_ip="$(container_ip_by_name "${container_name}")"
     current_ips_csv="$(get_container_ipv4s_csv "${container_name}")"
+    current_ipv6s="$(get_container_ipv6s_csv "${container_name}")"
     log "    container IP: ${current_ip}"
+    if [[ -n "${current_ipv6s}" ]]; then
+      log "    container IPv6: ${current_ipv6s}"
+    else
+      log "    container IPv6: not available"
+    fi
     if [[ "${container_name}" == amnezia-awg* ]]; then
       protocol_summary="$(awg_protocol_summary "${container_name}")"
       [[ -n "${protocol_summary}" ]] && log "    protocol: ${protocol_summary}"
@@ -1359,6 +1589,10 @@ show_container_block() {
       else
         log "    egress IP: ${egress_summary}"
       fi
+      if [[ -n "${current_ipv6s}" ]]; then
+        ipv6_egress_summary="$(container_ipv6_egress_summary "${container_name}")"
+        log "    egress IPv6: ${ipv6_egress_summary}"
+      fi
     fi
   fi
 }
@@ -1370,6 +1604,7 @@ menu_header() {
   xray_status="not found"
   WARP_IF="${WARP_IF:-}"
   detect_warp_if || true
+  detect_warp_ipv6
   detect_wan || true
 
   if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg'; then
@@ -1394,6 +1629,7 @@ menu_header() {
   log "  WAN IP: ${WAN_IP:-unknown}"
   log "  WAN subnet: ${WAN_SUBNET:-unknown}"
   log "  WARP interface: ${WARP_IF:-not found}"
+  log "  WARP IPv6: ${WARP_V6_IP:-not available}"
   log "  Amnezia bridge: ${AMN_IF:-auto}"
   log
   printf '%sContainers%s\n' "${C_BOLD}" "${C_RESET}"
@@ -1608,8 +1844,12 @@ show_status() {
   fi
   log "  Policy rules:"
   ip rule show 2>/dev/null | grep -E '10061|10062|10063|10066' | sed 's/^/    /' || log "    none"
+  log "  IPv6 policy rules:"
+  ip -6 rule show 2>/dev/null | grep -E '10061|10062|10063|10066' | sed 's/^/    /' || log "    none"
   log "  Routing table ${BASE_TABLE}:"
   ip route show table "${BASE_TABLE}" 2>/dev/null | sed 's/^/    /' || log "    empty"
+  log "  IPv6 routing table ${BASE_TABLE}:"
+  ip -6 route show table "${BASE_TABLE}" 2>/dev/null | sed 's/^/    /' || log "    empty"
 }
 
 prompt_menu_choice() {
@@ -1719,6 +1959,7 @@ run_selection() {
     install_host_warp
     detect_warp_if || true
   fi
+  detect_warp_ipv6
   refresh_managed_warp_profile
 
   case "${selection}" in
