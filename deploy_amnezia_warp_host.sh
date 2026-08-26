@@ -275,20 +275,22 @@ awg_version_from_tools() {
 }
 
 awg_display_title() {
-  local name="$1" fallback="$2" tools_version version generation
+  local name="$1" fallback="$2" tools_version version generation generation_major
+  generation="$(awg_protocol_generation "${name}")"
   tools_version="$(awg_tools_version "${name}")"
   version="$(awg_version_from_tools "${tools_version}")"
-  if [[ -n "${version}" ]]; then
-    printf 'AmneziaWG v%s\n' "${version}"
+
+  if [[ "${generation}" =~ ^AWG[[:space:]]+([0-9]+)\.x$ ]]; then
+    generation_major="${BASH_REMATCH[1]}"
+    if [[ "${version}" == "${generation_major}."* ]]; then
+      printf 'AmneziaWG v%s\n' "${version}"
+    else
+      printf 'AmneziaWG v%s.x\n' "${generation_major}"
+    fi
     return
   fi
 
-  generation="$(awg_protocol_generation "${name}")"
-  if [[ "${generation}" =~ ^AWG[[:space:]]+(.+)$ ]]; then
-    printf 'AmneziaWG v%s\n' "${BASH_REMATCH[1]}"
-  else
-    printf '%s\n' "${fallback}"
-  fi
+  printf '%s\n' "${fallback}"
 }
 
 awg_protocol_summary() {

@@ -70,6 +70,15 @@ test_awg_version_detection() {
   assert_eq "AmneziaWG v3.1" "$(awg_display_title amnezia-awg2 fallback)" "AWG display title from tools"
 
   docker() {
+    if [[ "$*" == *"awg --version"* ]]; then
+      printf 'amneziawg-tools v1.0.20210914 - https://amnezia.org\n'
+    else
+      printf 'AWG 2.x\n'
+    fi
+  }
+  assert_eq "AmneziaWG v2.x" "$(awg_display_title amnezia-awg2 fallback)" "AWG protocol must override mismatched tools version"
+
+  docker() {
     if [[ "$*" != *"awg --version"* ]]; then
       printf 'AWG 3.x\n'
     fi
