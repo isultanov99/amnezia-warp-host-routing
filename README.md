@@ -1,276 +1,120 @@
 # Amnezia WARP Host Routing
 
-[English](https://github.com/isultanov99/amnezia-warp-host-routing/blob/master/README.md) | [Russian](https://github.com/isultanov99/amnezia-warp-host-routing/blob/master/README_ru.md)
+[English](README.md) | [Русский](README_ru.md)
 
-## About
+Route internet-bound traffic from selected Amnezia Docker containers through host-level Cloudflare WARP while keeping inbound VPN connections on the VPS public IP. The host default route is not changed.
 
-Host-level Cloudflare WARP egress routing for Amnezia Docker containers.
+## Compatibility
 
-The installer creates timestamped pre-change backups and can roll back to a chosen snapshot from the menu.
+| Container | Protocol |
+| --- | --- |
+| `amnezia-awg` | Legacy AmneziaWG |
+| `amnezia-awg2` | Current AmneziaWG 2.x, 3.0, and 3.1 |
+| `amnezia-xray` | Amnezia Xray |
 
-This script solves a specific server-side problem:
-
-- `amnezia-awg`, `amnezia-awg2`, or `amnezia-xray` keeps accepting inbound VPN traffic on the VPS public IP
-- selected outgoing traffic from the container is policy-routed through a host WARP interface
-- external services see a Cloudflare IP instead of the VPS IP
-- the host default route stays unchanged
-
-This is useful when you want VPN clients to keep using the server as an entrypoint, but make their internet-bound egress leave through WARP.
-
-## TL;DR
-
-If you do not care about the implementation details:
-
-1. Run the script on the VPS where your `amnezia-awg`, `amnezia-awg2`, or `amnezia-xray` container lives.
-2. It keeps inbound VPN access on the VPS IP.
-3. It routes outgoing internet traffic from the selected container through Cloudflare WARP.
-4. After setup, the script itself shows whether WARP is up and what egress IP the container is using.
-5. If you already use another Cloudflare WARP-based setup, for example an existing `warp` or `wg0` interface from another tool or panel, the script can reuse it instead of creating a second one.
-
-## How It Works
-
-Under the hood the script does four things:
-
-1. Detects the Amnezia container IP, host WAN interface, Amnezia bridge, and Docker bridges.
-2. Ensures a host-level WARP interface exists.
-If one already exists, for example an existing `warp` or `wg0` interface from another Cloudflare WARP-based tool or panel, it reuses it.
-If one does not exist, it can bootstrap `wgcf` and create `/etc/wireguard/wgcf.conf` with `Table = off`.
-3. Installs system-level helper scripts and `systemd` units.
-4. Applies policy routing plus `iptables` mangle rules so only marked Amnezia container egress goes through WARP.
-
-The script does not replace the VPS default route and does not attempt to hide inbound listeners behind Cloudflare.
-
-During setup, the script writes files under `/etc` and `/usr/local/sbin`, creates `systemd` units, enables a timer, and applies live routing/firewall rules.
-
-## File
-
-- `deploy_amnezia_warp_host.sh`
-  - interactive installer for:
-  - `amnezia-awg` (legacy)
-  - `amnezia-awg2` (v2)
-  - `amnezia-xray` (xray)
-  - can install WARP if missing
-  - creates timestamped backup snapshots before each mutating step
-  - can roll back to a selected backup snapshot from the menu
-  - can uninstall and return the host to the pre-routing state
-  - shows network status, container IPs, routing state, live egress IP, WARP trace check, and debug info in the menu
-  - verifies active container egress with `curl`/`wget` against `https://ipinfo.io` and `http://ip-api.com/json/`
+AmneziaWG 3.x still uses the `amnezia-awg2` container name. The installer detects 3.x configuration parameters and displays the installed `amneziawg-tools` version in status output.
 
 ## Requirements
 
-Target host requirements:
+- Linux with `systemd` and root access
+- Docker with at least one supported container running
+- `iproute2`, `iptables`, `python3`, and `curl` or `wget`
+- WireGuard kernel support and outbound GitHub/Cloudflare access if the installer must create WARP through `wgcf`
 
-- Linux host with `systemd`
-- root access
-- Docker installed and running
-- Docker CLI available as `docker`
-- one of these containers present:
-- `amnezia-awg`, `amnezia-awg2`, or `amnezia-xray`
-- `ip` from `iproute2`
-- `iptables` with the mangle table available
-- `python3`
-- `curl` or `wget` for status and egress probes
+Supported package managers for automatic dependency installation are `apt-get`, `dnf`, and `yum`.
 
-For automatic WARP bootstrap through `wgcf`:
+## Install
 
-- Ubuntu/Debian, RHEL-family, or another distro with `apt-get`, `dnf`, or `yum`
-- outbound access to GitHub and Cloudflare
-- WireGuard kernel support and `wireguard-tools`
-
-If you already have a working WARP interface, automatic bootstrap is not required. In that case the script can reuse the existing interface and only needs the routing/firewall dependencies above.
-
-## Easy Install
-
-Run directly from GitHub with `curl`:
+Download and inspect the script, then run it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/isultanov99/amnezia-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
-```
-
-Interactive prompts are read from `/dev/tty`, so the menu still works with `curl | bash` when a TTY is available.
-
-Or with `wget`:
-
-```bash
-wget -qO- https://raw.githubusercontent.com/isultanov99/amnezia-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh | sudo bash
-```
-
-If you prefer to inspect the script before running it:
-
-```bash
-curl -fsSLO https://raw.githubusercontent.com/isultanov99/amnezia-warp-host-routing/refs/heads/master/deploy_amnezia_warp_host.sh
+curl -fsSLO https://raw.githubusercontent.com/isultanov99/amnezia-warp-host-routing/master/deploy_amnezia_warp_host.sh
 chmod +x deploy_amnezia_warp_host.sh
 sudo ./deploy_amnezia_warp_host.sh
 ```
 
-## Recommended Usage
+The interactive menu can install or remove routing per container, show status, and restore a backup.
 
-Run on the VPS:
-
-```bash
-chmod +x deploy_amnezia_warp_host.sh
-sudo ./deploy_amnezia_warp_host.sh
-```
-
-Typical menu:
-
-```text
-Amnezia WARP Host Routing
-
-Environment
-  WAN interface: eth0
-  WAN IP: 203.0.113.10
-  WAN subnet: 203.0.113.0/24
-  WARP interface: not found
-  Amnezia bridge: auto
-
-Containers
-  AmneziaWG Legacy: found
-    container IP: 172.29.172.2
-    routing service: not installed
-  AmneziaWG v2: found
-    container IP: 172.29.172.5
-    routing service: active
-    egress IP: 104.28.N.N | Gotham City | USA | Cloudflare, Inc.
-  Amnezia Xray: found
-    container IP: 172.29.172.3
-    routing service: not installed
-  Host WARP: not found
-
-1) Install WARP and route all detected containers
-2) Install or refresh routing for AWG Legacy only
-3) Install or refresh routing for AWG v2 only
-4) Install or refresh routing for Amnezia Xray only
-5) Remove everything configured by this script
-6) Rollback to a backup snapshot
-7) Show status
-8) Exit
-```
-
-Non-interactive install for everything found:
+Direct commands are also available:
 
 ```bash
-sudo AUTO_YES=1 ./deploy_amnezia_warp_host.sh
-```
+# All detected containers
+sudo ./deploy_amnezia_warp_host.sh install all
 
-Status:
+# Current AmneziaWG container, including AWG 3.0/3.1
+sudo ./deploy_amnezia_warp_host.sh install current
 
-```bash
+# Other individual targets
+sudo ./deploy_amnezia_warp_host.sh install legacy
+sudo ./deploy_amnezia_warp_host.sh install xray
+
+# Status and removal
 sudo ./deploy_amnezia_warp_host.sh status
+sudo ./deploy_amnezia_warp_host.sh uninstall current
+sudo ./deploy_amnezia_warp_host.sh uninstall all
 ```
 
-Uninstall:
+For backwards compatibility, `AUTO_YES=1` with no command installs all detected containers; with `uninstall`, it removes all managed routing.
+
+## Existing WARP interfaces
+
+The installer checks WireGuard-like interfaces with Cloudflare's trace endpoint and automatically reuses only an interface confirmed as WARP. This prevents unrelated tunnels such as `wg-home` from being selected accidentally.
+
+If trace verification is unavailable, select the interface explicitly:
 
 ```bash
-sudo ./deploy_amnezia_warp_host.sh uninstall
+sudo WARP_IF=wg0 ./deploy_amnezia_warp_host.sh install current
 ```
 
-Non-interactive uninstall:
-
-```bash
-sudo AUTO_YES=1 ./deploy_amnezia_warp_host.sh uninstall
-```
-
-## Optional Overrides
-
-The script accepts environment overrides for unusual network layouts.
-
-Most useful ones:
+Useful overrides:
 
 ```bash
 WARP_IF=wg0
 WAN_IF=eth0
 WARP_PROFILE_NAME=wgcf
-AUTO_YES=1
+BASE_TABLE=51820
+BACKUP_ROOT=/var/backups/amnezia-warp-host-routing
+NO_COLOR=1
 ```
 
-Example:
+## What it changes
 
-```bash
-sudo WARP_IF=wg0 WAN_IF=ens34 ./deploy_amnezia_warp_host.sh
-```
+The installer:
 
-## What Gets Installed
+1. Detects container addresses, the host WAN, and Docker bridges.
+2. Reuses verified WARP or creates `/etc/wireguard/wgcf.conf` with `Table = off`.
+3. Adds policy-routing rules and dedicated `iptables` mangle chains for selected container source addresses.
+4. Installs `systemd` routing units and a reconciliation timer that restores missing runtime rules and refreshes container IPs after Docker recreates a container.
 
-The installer writes system files on the host:
+Managed files live under:
 
-- `/usr/local/sbin/amnezia-warp-routing.sh`
-- `/usr/local/sbin/amnezia-warp-reconcile.sh`
-- `/etc/systemd/system/amnezia-warp-routing@.service`
-- `/etc/systemd/system/amnezia-warp-reconcile.service`
-- `/etc/systemd/system/amnezia-warp-reconcile.timer`
-- `/etc/amnezia-warp/*.env`
+- `/etc/amnezia-warp/`
+- `/etc/systemd/system/amnezia-warp-*`
+- `/usr/local/sbin/amnezia-warp-*`
 - `/etc/sysctl.d/99-amnezia-warp.conf`
-- timestamped snapshots under `/var/backups/amnezia-warp-host-routing` by default
+- `/etc/wireguard/` when WARP is created through `wgcf`
 
-It also applies runtime state:
+Timestamped pre-change snapshots are stored in `/var/backups/amnezia-warp-host-routing`. Restore them from the interactive menu.
 
-- enables and starts `amnezia-warp-routing@*.service` for selected containers
-- enables and starts `amnezia-warp-reconcile.timer`
-- adds `ip rule` entries for container fwmarks
-- writes routes into the configured policy routing table
-- creates and hooks managed `iptables` mangle chains
-- sets bridge netfilter sysctls for Docker bridge traffic
-
-If WARP is bootstrapped by the script, it also writes:
-
-- `/etc/wireguard/wgcf.conf`
-- `/etc/wireguard/wgcf-account.toml`
-- `/usr/local/bin/wgcf`
-
-## Rollback
-
-Before each mutating step, the script creates a timestamped snapshot of its managed files and service state.
-
-You can restore one from the interactive menu with:
-
-- `Rollback to a backup snapshot`
-
-By default, snapshots are stored in:
-
-- `/var/backups/amnezia-warp-host-routing`
-
-You can override the location with:
+## Verify
 
 ```bash
-BACKUP_ROOT=/custom/path
+sudo ./deploy_amnezia_warp_host.sh status
 ```
 
-## Verification
-
-After install, the script already prints a post-check:
-
-- host WARP trace status
-- live egress IP / country / city / ISP for the affected container
-
-If you still want to double-check manually, connect through the VPN and open any IP / ISP lookup site:
-
-- [myip.com](https://www.myip.com/)
-- [2ip.io](https://2ip.io/)
-- [WhatIsMyIPAddress](https://whatismyipaddress.com/)
-- [WhatIsMyISP](https://www.whatismyisp.com/)
-- [DNSChecker: What's My IP Address](https://dnschecker.org/whats-my-ip-address.php)
-
-You should see a Cloudflare-owned IP instead of the VPS IP.
-
-## Self-Healing
-
-The installer enables `amnezia-warp-reconcile.timer`.
-
-Every minute it checks the runtime kernel state for the configured containers:
-
-- `ip rule` entries for container fwmarks
-- the WARP default route in the routing table
-- managed `iptables` mangle chains and PREROUTING hooks
-
-If any of those runtime rules disappear while the systemd routing services still look active, the timer re-applies the existing `/etc/amnezia-warp/*.env` configuration.
+Status shows the detected AWG generation, routing services, WARP trace result, policy rules, and the container's live egress IP. A working setup should report WARP as active and a Cloudflare-owned egress IP while the VPS default route remains unchanged.
 
 ## Notes
 
-- This routes outgoing traffic only.
-- It does not hide inbound VPS ports behind Cloudflare.
-- It is designed around common Amnezia Docker layouts with `amn0` and `172.29.x.x`, but tries to autodetect when possible.
-- If the host already uses a WARP interface from another tool, the installer reuses it rather than replacing it.
+- Only outgoing container traffic is routed through WARP; inbound ports remain on the VPS IP.
+- Managed policy routing is currently IPv4-only; IPv6 traffic is not routed by this script.
+- Private and Docker subnets are excluded from WARP routing.
+- Existing `legacy.env`, `v2.env`, and `xray.env` files are migrated automatically when container IPs change; the `v2` service name remains compatible with AWG 2.x.
+- The installer skips stale configurations whose recorded WARP interface no longer exists, so one obsolete container configuration cannot block reconciliation for the others.
+
+## License
+
+[MIT](LICENSE)
 
 ## Support
 

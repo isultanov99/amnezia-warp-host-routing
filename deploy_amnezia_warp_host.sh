@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # It supports:
 # - amnezia-awg   (legacy)
-# - amnezia-awg2  (v2)
+# - amnezia-awg2  (current AWG 2.x/3.x)
 # - amnezia-xray  (xray)
 #
 # If no host WARP interface exists, it can install one via wgcf with Table=off,
@@ -23,6 +23,7 @@ WARP_ENDPOINT="${WARP_ENDPOINT:-162.159.192.1:2408}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/amnezia-warp-host-routing}"
 AUTO_YES="${AUTO_YES:-0}"
 ACTION="${1:-}"
+TARGET="${2:-}"
 
 CONTAINERS_FOUND=()
 CONTAINER_SRC_IP=()
@@ -163,8 +164,9 @@ usage() {
   cat <<'EOF'
 Usage:
   sudo bash deploy_amnezia_warp_host.sh
+  sudo bash deploy_amnezia_warp_host.sh install [all|legacy|current|xray]
   sudo AUTO_YES=1 bash deploy_amnezia_warp_host.sh
-  sudo bash deploy_amnezia_warp_host.sh uninstall
+  sudo bash deploy_amnezia_warp_host.sh uninstall [all|legacy|current|xray|warp]
   sudo bash deploy_amnezia_warp_host.sh status
 
 Environment overrides:
@@ -214,6 +216,38 @@ get_container_ipv4s_csv() {
   ips="$(get_container_ipv4s "${name}" | paste -sd',' -)"
   [[ -n "${ips}" ]] || die "could not determine IPv4s for container ${name}"
   printf '%s\n' "${ips}"
+}
+
+awg_protocol_summary() {
+  local name="$1"
+  local generation tools_version
+
+  generation="$(docker exec "${name}" sh -c '
+    config=
+    for candidate in /opt/amnezia/awg/awg0.conf /opt/amnezia/awg/wg0.conf; do
+      if [ -f "$candidate" ]; then
+        config="$candidate"
+        break
+      fi
+    done
+    [ -n "$config" ] || exit 1
+    if grep -q "^[[:space:]]*HeaderProtectionKey[[:space:]]*=" "$config"; then
+      printf "AWG 3.x"
+    elif grep -Eq "^[[:space:]]*(S3|S4|I[1-5])[[:space:]]*=" "$config"; then
+      printf "AWG 2.x"
+    else
+      printf "AWG 1.x"
+    fi
+  ' 2>/dev/null || true)"
+
+  tools_version="$(docker exec "${name}" sh -c 'awg --version 2>/dev/null | head -n1' 2>/dev/null || true)"
+  if [[ -n "${generation}" && -n "${tools_version}" ]]; then
+    printf '%s; %s\n' "${generation}" "${tools_version}"
+  elif [[ -n "${generation}" ]]; then
+    printf '%s\n' "${generation}"
+  elif [[ -n "${tools_version}" ]]; then
+    printf '%s\n' "${tools_version}"
+  fi
 }
 
 find_best_container_ip() {
@@ -458,10 +492,9 @@ routing_service_state() {
 detect_warp_if() {
   local ifname summary
   local candidates=()
+  local verified=()
   local options=()
   local labels=()
-  local warp_on_count=0
-  local warp_on_iface=""
   if [[ -n "${WARP_IF}" ]]; then
     have_iface "${WARP_IF}" || die "WARP interface not found: ${WARP_IF}"
     return
@@ -478,33 +511,31 @@ detect_warp_if() {
     return
   fi
 
-  if [[ "${#candidates[@]}" -eq 1 ]]; then
-    WARP_IF="${candidates[0]}"
-    return
-  fi
-
   for ifname in "${candidates[@]}"; do
     summary="$(warp_trace_summary_for_iface "${ifname}")"
-    labels+=("${ifname}")
-    options+=("${ifname} (${summary})")
     if [[ "${summary}" == warp=on* ]]; then
-      warp_on_count=$((warp_on_count + 1))
-      warp_on_iface="${ifname}"
+      verified+=("${ifname}")
+      labels+=("${ifname}")
+      options+=("${ifname} (${summary})")
     fi
   done
 
-  if [[ "${warp_on_count}" -eq 1 ]]; then
-    WARP_IF="${warp_on_iface}"
+  if [[ "${#verified[@]}" -eq 0 ]]; then
+    return
+  fi
+
+  if [[ "${#verified[@]}" -eq 1 ]]; then
+    WARP_IF="${verified[0]}"
     return
   fi
 
   if [[ "${AUTO_YES}" == "1" || ! -r /dev/tty ]]; then
-    WARP_IF="${candidates[0]}"
-    warn "Multiple WARP-like interfaces found. Auto-selected ${WARP_IF}. Set WARP_IF=... to override."
+    WARP_IF="${verified[0]}"
+    warn "Multiple verified WARP interfaces found. Auto-selected ${WARP_IF}. Set WARP_IF=... to override."
     return
   fi
 
-  warn "Multiple WARP-like interfaces found. Select the interface to use for host WARP routing:"
+  warn "Multiple verified WARP interfaces found. Select the interface to use for host WARP routing:"
   prompt_menu_choice "Choose WARP interface: " "${options[@]}"
   local idx
   for ((idx=0; idx<${#options[@]}; idx++)); do
@@ -947,7 +978,70 @@ mark_rule_exists() {
   iptables -t mangle -S "${CHAIN}" 2>/dev/null | grep -Fq -- "--set-xmark ${MARK}/"
 }
 
+container_for_env() {
+  local env_file="$1"
+  if [[ -n "${CONTAINER:-}" ]]; then
+    printf '%s\n' "${CONTAINER}"
+    return
+  fi
+  case "$(basename "${env_file}" .env)" in
+    legacy) printf 'amnezia-awg\n' ;;
+    v2) printf 'amnezia-awg2\n' ;;
+    xray) printf 'amnezia-xray\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+container_ipv4s() {
+  docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$1" 2>/dev/null \
+    | tr ' ' '\n' \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+    | sort -u || true
+}
+
+update_env_sources() {
+  local env_file="$1" container="$2" primary="$3" srcs="$4" tmp
+  tmp="$(mktemp "${env_file}.tmp.XXXXXX")"
+  awk -v container="${container}" -v src="${primary}/32" -v srcs="${srcs}" '
+    BEGIN { seen_container=0; seen_src=0; seen_srcs=0 }
+    /^CONTAINER=/ { print "CONTAINER=" container; seen_container=1; next }
+    /^SRC=/ { print "SRC=" src; seen_src=1; next }
+    /^SRCS=/ { print "SRCS=" srcs; seen_srcs=1; next }
+    { print }
+    END {
+      if (!seen_container) print "CONTAINER=" container
+      if (!seen_src) print "SRC=" src
+      if (!seen_srcs) print "SRCS=" srcs
+    }
+  ' "${env_file}" > "${tmp}"
+  chmod 0644 "${tmp}"
+  mv "${tmp}" "${env_file}"
+}
+
+refresh_container_sources() {
+  local env_file="$1" container current_list current_csv current_primary configured_csv
+  SOURCES_CHANGED=0
+  container="$(container_for_env "${env_file}" || true)"
+  [[ -n "${container}" ]] || return 0
+  current_list="$(container_ipv4s "${container}")"
+  [[ -n "${current_list}" ]] || return 0
+  current_csv="$(printf '%s\n' "${current_list}" | paste -sd',' -)"
+  current_primary="$(printf '%s\n' "${current_list}" | grep '^172\.29\.' | head -n1 || true)"
+  [[ -n "${current_primary}" ]] || current_primary="$(printf '%s\n' "${current_list}" | head -n1)"
+  configured_csv="$(printf '%s\n' "${SRCS:-${SRC%/32}}" | tr ',' '\n' | sed 's#/32$##' | sort -u | paste -sd',' -)"
+
+  CONTAINER="${container}"
+  if [[ "${configured_csv}" != "${current_csv}" || "${SRC:-}" != "${current_primary}/32" ]]; then
+    update_env_sources "${env_file}" "${container}" "${current_primary}" "${current_csv}" || return 1
+    SRC="${current_primary}/32"
+    SRCS="${current_csv}"
+    SOURCES_CHANGED=1
+    log "Updated $(basename "${env_file}") for ${container}: ${current_csv}"
+  fi
+}
+
 needs_reconcile() {
+  [[ "${SOURCES_CHANGED:-0}" == "1" ]] && return 0
   [[ -n "${TABLE:-}" && -n "${MARK:-}" && -n "${CHAIN:-}" && -n "${WARP_IF:-}" ]] || return 0
   ip link show "${WARP_IF}" >/dev/null 2>&1 || return 0
   rule_exists || return 0
@@ -967,28 +1061,49 @@ reconcile_env() {
   CHAIN=
   SRC=
   SRCS=
+  CONTAINER=
   WARP_IF=
   ROUTES=
   EXCLUDES=
+  SOURCES_CHANGED=0
 
   set -a
   # shellcheck disable=SC1090
-  . "${env_file}"
+  . "${env_file}" || {
+    set +a
+    log "Could not read $(basename "${env_file}")"
+    return 1
+  }
   set +a
 
+  refresh_container_sources "${env_file}" || return 1
+
+  if [[ -z "${WARP_IF:-}" ]] || ! ip link show "${WARP_IF}" >/dev/null 2>&1; then
+    log "Skipping $(basename "${env_file}"): WARP interface ${WARP_IF:-<unset>} is missing"
+    return 0
+  fi
+
   if needs_reconcile; then
+    local suffix service_name
+    suffix="$(basename "${env_file}" .env)"
+    service_name="amnezia-warp-routing@${suffix}.service"
     log "Re-applying Amnezia WARP routing for $(basename "${env_file}")"
-    "${ROUTING_HELPER}" up "${env_file}"
+    if systemctl cat "${service_name}" >/dev/null 2>&1; then
+      systemctl restart "${service_name}"
+    else
+      "${ROUTING_HELPER}" up "${env_file}"
+    fi
   fi
 }
 
 main() {
-  local env_file
+  local env_file failed=0
   [[ -x "${ROUTING_HELPER}" ]] || exit 0
   while IFS= read -r env_file; do
     [[ -n "${env_file}" ]] || continue
-    reconcile_env "${env_file}"
+    reconcile_env "${env_file}" || failed=1
   done < <(env_files || true)
+  return "${failed}"
 }
 
 main "$@"
@@ -1075,6 +1190,7 @@ configure_container() {
   service_name="amnezia-warp-routing@${suffix}.service"
 
   cat > "${env_file}" <<EOF
+CONTAINER=${name}
 TABLE=${BASE_TABLE}
 MARK=${mark}
 PRIO=${prio}
@@ -1210,7 +1326,7 @@ container_egress_summary() {
 }
 
 show_container_block() {
-  local title="$1" container_name="$2" suffix="$3" found_state service_state egress_summary current_ip configured_src configured_srcs current_ips_csv
+  local title="$1" container_name="$2" suffix="$3" found_state service_state egress_summary current_ip configured_src configured_srcs current_ips_csv protocol_summary
   found_state="not found"
   if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx "${container_name}"; then
     found_state="found"
@@ -1222,6 +1338,10 @@ show_container_block() {
     current_ip="$(container_ip_by_name "${container_name}")"
     current_ips_csv="$(get_container_ipv4s_csv "${container_name}")"
     log "    container IP: ${current_ip}"
+    if [[ "${container_name}" == amnezia-awg* ]]; then
+      protocol_summary="$(awg_protocol_summary "${container_name}")"
+      [[ -n "${protocol_summary}" ]] && log "    protocol: ${protocol_summary}"
+    fi
     log "    routing service: $(state_text "${service_state}")"
     configured_src="$(service_src_from_env "${suffix}" || true)"
     configured_srcs="$(service_srcs_from_env "${suffix}" || true)"
@@ -1278,7 +1398,7 @@ menu_header() {
   log
   printf '%sContainers%s\n' "${C_BOLD}" "${C_RESET}"
   show_container_block "AmneziaWG Legacy" "amnezia-awg" "legacy"
-  show_container_block "AmneziaWG v2" "amnezia-awg2" "v2"
+  show_container_block "AmneziaWG Current (2.x/3.x)" "amnezia-awg2" "v2"
   show_container_block "Amnezia Xray" "amnezia-xray" "xray"
   log "  Host WARP: $(state_text "${warp_status}")"
   printf '\n'
@@ -1540,7 +1660,7 @@ choose_main_action() {
     fi
     if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
       labels+=("install:v2")
-      options+=("Install or refresh routing for AWG v2 only")
+      options+=("Install or refresh routing for current AWG (2.x/3.x) only")
     fi
     if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-xray'; then
       labels+=("install:xray")
@@ -1556,7 +1676,7 @@ choose_main_action() {
     fi
     if printf '%s\n' "${configured[@]}" | grep -qx 'v2'; then
       labels+=("remove:v2")
-      options+=("Remove AWG v2 routing")
+      options+=("Remove current AWG (2.x/3.x) routing")
     fi
     if printf '%s\n' "${configured[@]}" | grep -qx 'xray'; then
       labels+=("remove:xray")
@@ -1650,7 +1770,7 @@ run_selection() {
         show_container_block "AmneziaWG Legacy" "amnezia-awg" "legacy"
       fi
       if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-awg2'; then
-        show_container_block "AmneziaWG v2" "amnezia-awg2" "v2"
+        show_container_block "AmneziaWG Current (2.x/3.x)" "amnezia-awg2" "v2"
       fi
       if printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx 'amnezia-xray'; then
         show_container_block "Amnezia Xray" "amnezia-xray" "xray"
@@ -1660,12 +1780,38 @@ run_selection() {
       show_container_block "AmneziaWG Legacy" "amnezia-awg" "legacy"
       ;;
     v2)
-      show_container_block "AmneziaWG v2" "amnezia-awg2" "v2"
+      show_container_block "AmneziaWG Current (2.x/3.x)" "amnezia-awg2" "v2"
       ;;
     xray)
       show_container_block "Amnezia Xray" "amnezia-xray" "xray"
       ;;
   esac
+}
+
+normalize_target() {
+  local target="${1:-all}"
+  case "${target}" in
+    all) printf 'all\n' ;;
+    legacy|awg-legacy) printf 'legacy\n' ;;
+    current|awg|awg2|v2) printf 'v2\n' ;;
+    xray) printf 'xray\n' ;;
+    warp|warp-only) printf 'warp-only\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+require_container_for_selection() {
+  local selection="$1"
+  local name
+  case "${selection}" in
+    all) return 0 ;;
+    legacy) name="amnezia-awg" ;;
+    v2) name="amnezia-awg2" ;;
+    xray) name="amnezia-xray" ;;
+    *) return 0 ;;
+  esac
+  printf '%s\n' "${CONTAINERS_FOUND[@]}" | grep -qx "${name}" \
+    || die "container ${name} was not found or has no IPv4 address"
 }
 
 main() {
@@ -1684,12 +1830,31 @@ main() {
   esac
 
   detect_containers
+  if [[ "${ACTION}" == "install" ]]; then
+    local selection
+    selection="$(normalize_target "${TARGET:-all}")" || die "unknown install target: ${TARGET}"
+    [[ "${selection}" != "warp-only" ]] || die "warp is not a valid install target"
+    require_container_for_selection "${selection}"
+    detect_warp_if || true
+    run_selection "${selection}"
+    return
+  fi
+
   if [[ "${ACTION}" == "status" ]]; then
+    [[ -z "${TARGET}" ]] || die "status does not accept a target"
     show_status
     return
   fi
 
   if [[ "${ACTION}" == "uninstall" ]]; then
+    if [[ -n "${TARGET}" ]]; then
+      local selection
+      selection="$(normalize_target "${TARGET}")" || die "unknown uninstall target: ${TARGET}"
+      detect_warp_if || true
+      create_backup_snapshot "pre-uninstall-${selection}"
+      run_uninstall "${selection}"
+      return
+    fi
     menu_header
     if [[ "${AUTO_YES}" == "1" ]]; then
       create_backup_snapshot "pre-uninstall-all"
@@ -1714,6 +1879,8 @@ main() {
     fi
     return
   fi
+
+  [[ -z "${ACTION}" ]] || die "unknown action: ${ACTION}"
 
   while true; do
     menu_header
@@ -1747,4 +1914,6 @@ main() {
   done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
